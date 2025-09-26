@@ -1,0 +1,11 @@
+[package]
+name = "llm-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+cublas = "0.2.0"
+cuda_std = "0.2.2"
+cust = "0.3.2"
+rand = "0.9.2"
