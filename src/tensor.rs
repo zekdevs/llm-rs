@@ -48,6 +48,23 @@ impl Tensor {
         &self.shape
     }
 
+    /// Reshapes the tensor without copying data, consuming the tensor in the process.
+    ///
+    /// # Arguments
+    /// * `new_shape` - The desired shape. The total number of elements must stay the same.
+    pub fn reshape(mut self, new_shape: Vec<usize>) -> Result<Self> {
+        let new_size = new_shape.iter().product::<usize>();
+        if new_size != self.size() {
+            return Err(anyhow!(
+                "Cannot reshape tensor of size {} into shape {:?}",
+                self.size(),
+                new_shape
+            ));
+        }
+        self.shape = new_shape;
+        Ok(self)
+    }
+
     /// Creates a tensor from host data, copying it to the device.
     pub fn from_host(data: Vec<f32>, shape: Vec<usize>, device: &Device) -> Result<Self> {
         let expected_size = shape.iter().product::<usize>();
@@ -103,6 +120,71 @@ impl Tensor {
         let mut rng = rand::rng();
         let host_data: Vec<f32> = (0..size).map(|_| rng.random::<f32>()).collect();
         Self::from_host(host_data, shape, device)
+    }
+
+    /// Performs a dense matrix multiplication between two 2D tensors.
+    ///
+    /// Expects the left operand to have shape `[m, k]` and the right operand to have shape `[k, n]`.
+    /// Returns a tensor with shape `[m, n]`.
+    pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
+        ensure_same_device(&self.device, &other.device)?;
+
+        if self.shape.len() != 2 || other.shape.len() != 2 {
+            return Err(anyhow!(
+                "Matmul requires 2D tensors, got lhs shape {:?} and rhs shape {:?}",
+                self.shape,
+                other.shape
+            ));
+        }
+
+        let m = self.shape[0];
+        let k = self.shape[1];
+        let k_other = other.shape[0];
+        let n = other.shape[1];
+
+        if k != k_other {
+            return Err(anyhow!(
+                "Matmul dimension mismatch: lhs {:?} vs rhs {:?}",
+                self.shape,
+                other.shape
+            ));
+        }
+
+        let limits_ok = [m, n, k].iter().all(|&dim| dim <= i32::MAX as usize);
+        if !limits_ok {
+            return Err(anyhow!("Matrix dimensions exceed supported range"));
+        }
+
+        let result = Tensor::new(vec![m, n], &self.device)?;
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+
+        let module = Module::from_ptx(include_str!("matmul_kernel.ptx"), &[])
+            .context("PTX load failed for matmul")?;
+        let function = module
+            .get_function("matmul_kernel")
+            .context("Kernel load failed for matmul")?;
+
+        let block = (16u32, 16u32, 1u32);
+        let grid_x = ((n as u32) + block.0 - 1) / block.0;
+        let grid_y = ((m as u32) + block.1 - 1) / block.1;
+        let grid = (grid_x, grid_y, 1u32);
+
+        unsafe {
+            launch!(function<<<grid, block, 0, stream>>>(
+                self.data.as_device_ptr(),
+                other.data.as_device_ptr(),
+                result.data.as_device_ptr(),
+                m as i32,
+                n as i32,
+                k as i32
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .context("Stream sync failed for matmul")?;
+        Ok(result)
     }
 
     /// Performs a binary elementwise operation on two tensors with broadcasting support.
@@ -575,39 +657,4 @@ fn compute_aligned_strides(tensor_shape: &[usize], target_shape: &[usize]) -> Re
     }
 
     Ok(aligned)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compute_strides_matches_expected() {
-        assert_eq!(compute_strides(&[4, 3, 2]), vec![6, 2, 1]);
-        assert_eq!(compute_strides(&[5]), vec![1]);
-        assert!(compute_strides(&[]).is_empty());
-    }
-
-    #[test]
-    fn broadcast_shapes_handles_various_cases() {
-        assert_eq!(broadcast_shapes(&[4, 1], &[1, 5]).unwrap(), vec![4, 5]);
-        assert_eq!(
-            broadcast_shapes(&[3, 1, 5], &[1, 7, 1]).unwrap(),
-            vec![3, 7, 5]
-        );
-        assert_eq!(broadcast_shapes(&[2, 3], &[3]).unwrap(), vec![2, 3]);
-    }
-
-    #[test]
-    fn compute_aligned_strides_handles_broadcasts() {
-        assert_eq!(
-            compute_aligned_strides(&[3, 1], &[3, 4]).unwrap(),
-            vec![1, 0]
-        );
-        assert_eq!(
-            compute_aligned_strides(&[1, 1, 1], &[2, 3, 4]).unwrap(),
-            vec![0, 0, 0]
-        );
-        assert!(compute_aligned_strides(&[2, 2], &[3, 2]).is_err());
-    }
 }

@@ -16,6 +16,11 @@ fn main() {
         ("max_reduce_kernel.cu", "max_reduce_kernel.ptx"),
         ("exp_kernel.cu", "exp_kernel.ptx"),
         ("sum_reduce_kernel.cu", "sum_reduce_kernel.ptx"),
+        ("matmul_kernel.cu", "matmul_kernel.ptx"),
+        ("split_heads_kernel.cu", "split_heads_kernel.ptx"),
+        ("merge_heads_kernel.cu", "merge_heads_kernel.ptx"),
+        ("attention_scores_kernel.cu", "attention_scores_kernel.ptx"),
+        ("apply_attention_kernel.cu", "apply_attention_kernel.ptx"),
     ];
 
     for (cu_file, ptx_file) in kernels {
