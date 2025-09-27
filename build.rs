@@ -6,13 +6,16 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let src_dir = Path::new("src");
 
-    // List of kernels: (cu_filename, ptx_filename)
     let kernels = [
         ("add_kernel.cu", "add_kernel.ptx"),
         ("sub_kernel.cu", "sub_kernel.ptx"),
         ("mul_kernel.cu", "mul_kernel.ptx"),
         ("div_kernel.cu", "div_kernel.ptx"),
         ("add_scalar_kernel.cu", "add_scalar_kernel.ptx"),
+        ("relu_kernel.cu", "relu_kernel.ptx"), // Replaced gelu_kernel.cu
+        ("max_reduce_kernel.cu", "max_reduce_kernel.ptx"),
+        ("exp_kernel.cu", "exp_kernel.ptx"),
+        ("sum_reduce_kernel.cu", "sum_reduce_kernel.ptx"),
     ];
 
     for (cu_file, ptx_file) in kernels {

@@ -1,11 +1,10 @@
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, anyhow};
 use cust::memory::DeviceBuffer;
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use rand::prelude::*;
+use std::mem::size_of;
 use std::usize;
 
 /// A tensor stored on the GPU device.
@@ -13,7 +12,7 @@ use std::usize;
 /// # Fields
 /// - `data`: The device buffer containing tensor elements.
 /// - `device`: The CUDA device associated with this tensor.
-/// - `dimentions`: The shape of the tensor (e.g., `[2, 3]` for a 2x3 matrix).
+/// - `dimensions`: The shape of the tensor (e.g., `[2, 3]` for a 2x3 matrix).
 pub struct Tensor {
     pub data: DeviceBuffer<f32>,
     pub device: Device,
@@ -42,6 +41,11 @@ impl Tensor {
     /// Returns the total number of elements in the tensor.
     pub fn size(&self) -> usize {
         self.shape.iter().product()
+    }
+
+    /// Returns a read-only view of the tensor shape.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
     }
 
     /// Creates a tensor from host data, copying it to the device.
@@ -101,6 +105,22 @@ impl Tensor {
         Self::from_host(host_data, shape, device)
     }
 
+    /// Performs a binary elementwise operation on two tensors with broadcasting support.
+    ///
+    /// This method handles broadcasting of tensor shapes, computes the output shape,
+    /// prepares broadcast plans for both operands, loads the specified CUDA kernel, and launches it on the GPU.
+    ///
+    /// # Arguments
+    /// * `other` - The other tensor to operate with.
+    /// * `kernel` - The kernel specification containing PTX source and function name.
+    ///
+    /// # Returns
+    /// A `Result` containing the resulting `Tensor` or an error.
+    ///
+    /// # Errors
+    /// - If tensors are on different devices.
+    /// - If broadcasting fails.
+    /// - If CUDA operations fail.
     fn binary_elementwise(&self, other: &Tensor, kernel: KernelSpec) -> Result<Tensor> {
         ensure_same_device(&self.device, &other.device)?;
 
@@ -145,7 +165,7 @@ impl Tensor {
         Ok(result)
     }
 
-    /// Adds two tensors, supporting NumPy-style broadcasting.
+    /// Adds two tensors, supporting broadcasting.
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
         self.binary_elementwise(
             other,
@@ -234,9 +254,148 @@ impl Tensor {
         }
         self.mul_scalar(1.0 / scalar)
     }
+
+    /// Applies the ReLU activation to every element of the tensor.
+    pub fn relu(&self) -> Result<Tensor> {
+        self.unary_elementwise(KernelSpec::new(
+            "relu",
+            include_str!("relu_kernel.ptx"),
+            "relu_kernel",
+        ))
+    }
+
+    /// Applies the exponential function elementwise.
+    pub fn exp(&self) -> Result<Tensor> {
+        self.unary_elementwise(KernelSpec::new(
+            "exp",
+            include_str!("exp_kernel.ptx"),
+            "exp_kernel",
+        ))
+    }
+
+    /// Applies a numerically stable softmax along the feature dimension of a 2D tensor.
+    pub fn softmax(&self) -> Result<Tensor> {
+        if self.shape.len() != 2 {
+            return Err(anyhow!(
+                "Softmax currently supports 2D tensors shaped [batch, features], but received {:?}",
+                self.shape
+            ));
+        }
+
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+
+        let row_max = self.rowwise_max(rows, cols)?;
+        let shifted = self.sub(&row_max)?;
+        let exponentiated = shifted.exp()?;
+        let row_sum = exponentiated.rowwise_sum(rows, cols)?;
+        let denom = row_sum.add_scalar(1e-12)?;
+        exponentiated.div(&denom)
+    }
+
+    fn unary_elementwise(&self, kernel: KernelSpec) -> Result<Tensor> {
+        let result = Tensor::new(self.shape.clone(), &self.device)?;
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+
+        let module = Module::from_ptx(kernel.ptx_source, &[])
+            .with_context(|| format!("PTX load failed for {}", kernel.human_name))?;
+        let function = module
+            .get_function(kernel.function_name)
+            .with_context(|| format!("Kernel load failed for {}", kernel.human_name))?;
+
+        let n = self.size() as i32;
+        let grid_size = ((n + 255) / 256) as u32;
+        let block_size = 256u32;
+
+        unsafe {
+            launch!(function<<<grid_size, block_size, 0, stream>>>(
+                self.data.as_device_ptr(),
+                result.data.as_device_ptr(),
+                n
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .with_context(|| format!("Stream sync failed for {}", kernel.human_name))?;
+        Ok(result)
+    }
+
+    fn rowwise_max(&self, rows: usize, cols: usize) -> Result<Tensor> {
+        self.rowwise_reduce(
+            KernelSpec::new(
+                "rowwise max",
+                include_str!("max_reduce_kernel.ptx"),
+                "max_reduce_kernel",
+            ),
+            rows,
+            cols,
+        )
+    }
+
+    fn rowwise_sum(&self, rows: usize, cols: usize) -> Result<Tensor> {
+        self.rowwise_reduce(
+            KernelSpec::new(
+                "rowwise sum",
+                include_str!("sum_reduce_kernel.ptx"),
+                "sum_reduce_kernel",
+            ),
+            rows,
+            cols,
+        )
+    }
+
+    fn rowwise_reduce(&self, kernel: KernelSpec, rows: usize, cols: usize) -> Result<Tensor> {
+        if rows == 0 || cols == 0 {
+            return Err(anyhow!(
+                "Row-wise reduction requires non-zero shape, got rows={}, cols={}",
+                rows,
+                cols
+            ));
+        }
+
+        if self.shape.len() != 2 || self.shape[0] != rows || self.shape[1] != cols {
+            return Err(anyhow!(
+                "Row-wise reduction expects tensor shape [{}, {}], found {:?}",
+                rows,
+                cols,
+                self.shape
+            ));
+        }
+
+        let result = Tensor::new(vec![rows, 1], &self.device)?;
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+
+        let module = Module::from_ptx(kernel.ptx_source, &[])
+            .with_context(|| format!("PTX load failed for {}", kernel.human_name))?;
+        let function = module
+            .get_function(kernel.function_name)
+            .with_context(|| format!("Kernel load failed for {}", kernel.human_name))?;
+
+        let block_size = 256u32;
+        let grid_size = rows as u32;
+        let shared_bytes = (block_size as usize * size_of::<f32>()) as u32;
+
+        unsafe {
+            launch!(function<<<grid_size, block_size, shared_bytes, stream>>>(
+                self.data.as_device_ptr(),
+                result.data.as_device_ptr(),
+                rows as i32,
+                cols as i32
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .with_context(|| format!("Stream sync failed for {}", kernel.human_name))?;
+        Ok(result)
+    }
 }
 
 impl Clone for Tensor {
+    /// Creates a deep copy of the tensor, including its data on the device.
     fn clone(&self) -> Self {
         let mut new_data =
             DeviceBuffer::zeroed(self.size()).expect("Failed to allocate device memory");
@@ -259,6 +418,12 @@ struct KernelSpec {
 }
 
 impl KernelSpec {
+    /// Creates a new `KernelSpec`.
+    ///
+    /// # Arguments
+    /// * `human_name` - A human-readable name for the kernel.
+    /// * `ptx_source` - The PTX source code as a string.
+    /// * `function_name` - The name of the kernel function.
     const fn new(
         human_name: &'static str,
         ptx_source: &'static str,
@@ -272,11 +437,20 @@ impl KernelSpec {
     }
 }
 
+/// Plan for broadcasting a tensor to a target shape, containing device strides.
 struct BroadcastPlan {
     device_strides: DeviceBuffer<usize>,
 }
 
 impl BroadcastPlan {
+    /// Creates a new broadcast plan for the given tensor and target shape.
+    ///
+    /// # Arguments
+    /// * `tensor` - The tensor to broadcast.
+    /// * `target_shape` - The target shape to broadcast to.
+    ///
+    /// # Returns
+    /// A `Result` containing the `BroadcastPlan` or an error.
     fn new(tensor: &Tensor, target_shape: &[usize]) -> Result<Self> {
         let aligned = compute_aligned_strides(&tensor.shape, target_shape)?;
         let device_strides = DeviceBuffer::from_slice(&aligned)?;
@@ -284,6 +458,14 @@ impl BroadcastPlan {
     }
 }
 
+/// Ensures that two devices are the same.
+///
+/// # Arguments
+/// * `lhs` - The first device.
+/// * `rhs` - The second device.
+///
+/// # Returns
+/// A `Result` indicating success or an error if devices differ.
 fn ensure_same_device(lhs: &Device, rhs: &Device) -> Result<()> {
     if lhs.as_raw() != rhs.as_raw() {
         Err(anyhow!("Operands must reside on the same CUDA device"))
@@ -292,6 +474,14 @@ fn ensure_same_device(lhs: &Device, rhs: &Device) -> Result<()> {
     }
 }
 
+/// Computes the broadcasted shape of two tensors.
+///
+/// # Arguments
+/// * `lhs` - The shape of the first tensor.
+/// * `rhs` - The shape of the second tensor.
+///
+/// # Returns
+/// A `Result` containing the broadcasted shape or an error if incompatible.
 fn broadcast_shapes(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>> {
     let max_rank = lhs.len().max(rhs.len());
     let mut result = Vec::with_capacity(max_rank);
@@ -323,6 +513,15 @@ fn broadcast_shapes(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>> {
     Ok(result)
 }
 
+/// Computes the strides for a given shape.
+///
+/// Strides represent the number of elements to skip to move to the next dimension.
+///
+/// # Arguments
+/// * `shape` - The shape of the tensor.
+///
+/// # Returns
+/// A vector of strides.
 fn compute_strides(shape: &[usize]) -> Vec<usize> {
     if shape.is_empty() {
         return Vec::new();
@@ -335,6 +534,14 @@ fn compute_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
+/// Computes aligned strides for broadcasting a tensor shape to a target shape.
+///
+/// # Arguments
+/// * `tensor_shape` - The original shape of the tensor.
+/// * `target_shape` - The target shape to broadcast to.
+///
+/// # Returns
+/// A `Result` containing the aligned strides or an error if broadcasting is invalid.
 fn compute_aligned_strides(tensor_shape: &[usize], target_shape: &[usize]) -> Result<Vec<usize>> {
     let tensor_rank = tensor_shape.len();
     let target_rank = target_shape.len();
