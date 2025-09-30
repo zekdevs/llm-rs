@@ -3,11 +3,11 @@ use cust::device::Device;
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
+use std::convert::TryFrom;
 
 use crate::tensor::Tensor;
 
 pub trait Layer {
-    /// Executes the forward pass of the layer on the GPU.
     fn forward(&self, input: &Tensor) -> Result<Tensor>;
 }
 
@@ -53,6 +53,7 @@ impl Layer for SoftmaxLayer {
         input.softmax()
     }
 }
+
 
 pub struct MultiHeadAttention {
     embed_dim: usize,
@@ -523,5 +524,331 @@ impl Layer for MultiHeadAttention {
         };
 
         output.reshape(vec![batch_size, seq_len, embed_dim])
+    }
+}
+
+pub struct FeedForwardNetwork {
+    input_dim: usize,
+    hidden_dim: usize,
+    w1: Tensor,
+    b1: Option<Tensor>,
+    w2: Tensor,
+    b2: Option<Tensor>,
+    activation: ActivationKind,
+}
+
+#[allow(dead_code)]
+impl FeedForwardNetwork {
+    pub fn new(
+        device: &Device,
+        input_dim: usize,
+        hidden_dim: usize,
+        activation: ActivationKind,
+    ) -> Result<Self> {
+        let w1 = Tensor::randn(vec![input_dim, hidden_dim], device)?;
+        let w2 = Tensor::randn(vec![hidden_dim, input_dim], device)?;
+        let b1 = Tensor::new(vec![1, hidden_dim], device)?;
+        let b2 = Tensor::new(vec![1, input_dim], device)?;
+        Self::assemble(
+            input_dim,
+            hidden_dim,
+            w1,
+            Some(b1),
+            w2,
+            Some(b2),
+            activation,
+        )
+    }
+
+    pub fn new_without_bias(
+        device: &Device,
+        input_dim: usize,
+        hidden_dim: usize,
+        activation: ActivationKind,
+    ) -> Result<Self> {
+        let w1 = Tensor::randn(vec![input_dim, hidden_dim], device)?;
+        let w2 = Tensor::randn(vec![hidden_dim, input_dim], device)?;
+        Self::assemble(input_dim, hidden_dim, w1, None, w2, None, activation)
+    }
+
+    pub fn from_host(
+        device: &Device,
+        input_dim: usize,
+        hidden_dim: usize,
+        w1: Vec<f32>,
+        b1: Option<Vec<f32>>,
+        w2: Vec<f32>,
+        b2: Option<Vec<f32>>,
+        activation: ActivationKind,
+    ) -> Result<Self> {
+        let w1 = Tensor::from_host(w1, vec![input_dim, hidden_dim], device)?;
+        let w2 = Tensor::from_host(w2, vec![hidden_dim, input_dim], device)?;
+        let b1 = match b1 {
+            Some(data) => Some(Tensor::from_host(data, vec![1, hidden_dim], device)?),
+            None => None,
+        };
+        let b2 = match b2 {
+            Some(data) => Some(Tensor::from_host(data, vec![1, input_dim], device)?),
+            None => None,
+        };
+
+        Self::assemble(input_dim, hidden_dim, w1, b1, w2, b2, activation)
+    }
+
+    fn assemble(
+        input_dim: usize,
+        hidden_dim: usize,
+        w1: Tensor,
+        b1: Option<Tensor>,
+        w2: Tensor,
+        b2: Option<Tensor>,
+        activation: ActivationKind,
+    ) -> Result<Self> {
+        if input_dim == 0 || hidden_dim == 0 {
+            return Err(anyhow!("FeedForwardNetwork dimensions must be greater than zero"));
+        }
+
+        if w1.shape() != &[input_dim, hidden_dim] {
+            return Err(anyhow!(
+                "w1 must have shape [{}, {}], found {:?}",
+                input_dim,
+                hidden_dim,
+                w1.shape()
+            ));
+        }
+        if w2.shape() != &[hidden_dim, input_dim] {
+            return Err(anyhow!(
+                "w2 must have shape [{}, {}], found {:?}",
+                hidden_dim,
+                input_dim,
+                w2.shape()
+            ));
+        }
+
+        let device_raw = w1.device.as_raw();
+        if w2.device.as_raw() != device_raw {
+            return Err(anyhow!("FeedForwardNetwork weights must share the same device"));
+        }
+
+        for (bias, expected) in [
+            (b1.as_ref(), hidden_dim),
+            (b2.as_ref(), input_dim),
+        ] {
+            if let Some(bias) = bias {
+                if bias.device.as_raw() != device_raw {
+                    return Err(anyhow!("FeedForwardNetwork biases must share the same device"));
+                }
+                if bias.shape() != &[1, expected] {
+                    return Err(anyhow!(
+                        "Bias must have shape [1, {}], found {:?}",
+                        expected,
+                        bias.shape()
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            input_dim,
+            hidden_dim,
+            w1,
+            b1,
+            w2,
+            b2,
+            activation,
+        })
+    }
+}
+
+impl Layer for FeedForwardNetwork {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        if input.shape().is_empty() {
+            return Err(anyhow!(
+                "FeedForwardNetwork expects input with at least one dimension, got {:?}",
+                input.shape()
+            ));
+        }
+
+        if *input.shape().last().unwrap() != self.input_dim {
+            return Err(anyhow!(
+                "FeedForwardNetwork expects last dimension {} but found {}",
+                self.input_dim,
+                input.shape().last().unwrap()
+            ));
+        }
+
+        if input.device.as_raw() != self.w1.device.as_raw() {
+            return Err(anyhow!(
+                "FeedForwardNetwork input tensor must share the same device as the weights"
+            ));
+        }
+
+        let rows = input.size() / self.input_dim;
+        if rows == 0 {
+            return Err(anyhow!("FeedForwardNetwork cannot process an empty input tensor"));
+        }
+
+        let flat = input
+            .clone()
+            .reshape(vec![rows, self.input_dim])?;
+
+        let mut hidden = flat.matmul(&self.w1)?;
+        if let Some(bias) = &self.b1 {
+            hidden = hidden.add(bias)?;
+        }
+
+        debug_assert_eq!(hidden.shape(), &[rows, self.hidden_dim]);
+
+        hidden = match self.activation {
+            ActivationKind::Relu => hidden.relu()?,
+        };
+
+        let mut output = hidden.matmul(&self.w2)?;
+        if let Some(bias) = &self.b2 {
+            output = output.add(bias)?;
+        }
+
+        debug_assert_eq!(output.shape(), &[rows, self.input_dim]);
+
+        output.reshape(input.shape().to_vec())
+    }
+}
+
+pub struct LayerNorm {
+    normalized_dim: usize,
+    gamma: Tensor,
+    beta: Tensor,
+    eps: f32,
+}
+
+#[allow(dead_code)]
+impl LayerNorm {
+    pub fn new(device: &Device, normalized_dim: usize, eps: f32) -> Result<Self> {
+        let gamma = Tensor::ones(vec![normalized_dim], device)?;
+        let beta = Tensor::new(vec![normalized_dim], device)?;
+        Self::assemble(normalized_dim, gamma, beta, eps)
+    }
+
+    pub fn from_host(
+        device: &Device,
+        normalized_dim: usize,
+        gamma: Option<Vec<f32>>,
+        beta: Option<Vec<f32>>,
+        eps: f32,
+    ) -> Result<Self> {
+        let gamma = match gamma {
+            Some(values) => Tensor::from_host(values, vec![normalized_dim], device)?,
+            None => Tensor::ones(vec![normalized_dim], device)?,
+        };
+        let beta = match beta {
+            Some(values) => Tensor::from_host(values, vec![normalized_dim], device)?,
+            None => Tensor::new(vec![normalized_dim], device)?,
+        };
+
+        Self::assemble(normalized_dim, gamma, beta, eps)
+    }
+
+    fn assemble(normalized_dim: usize, gamma: Tensor, beta: Tensor, eps: f32) -> Result<Self> {
+        if normalized_dim == 0 {
+            return Err(anyhow!("LayerNorm normalized dimension must be greater than zero"));
+        }
+
+        if gamma.shape() != &[normalized_dim] {
+            return Err(anyhow!(
+                "gamma must have shape [{}], found {:?}",
+                normalized_dim,
+                gamma.shape()
+            ));
+        }
+
+        if beta.shape() != &[normalized_dim] {
+            return Err(anyhow!(
+                "beta must have shape [{}], found {:?}",
+                normalized_dim,
+                beta.shape()
+            ));
+        }
+
+        if gamma.device.as_raw() != beta.device.as_raw() {
+            return Err(anyhow!("LayerNorm gamma and beta must live on the same device"));
+        }
+
+        Ok(Self {
+            normalized_dim,
+            gamma,
+            beta,
+            eps,
+        })
+    }
+}
+
+impl Layer for LayerNorm {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        if input.shape().is_empty() {
+            return Err(anyhow!("LayerNorm expects a tensor with at least one dimension"));
+        }
+
+        let last_dim = *input.shape().last().unwrap();
+        if last_dim != self.normalized_dim {
+            return Err(anyhow!(
+                "LayerNorm expected last dimension {} but found {}",
+                self.normalized_dim,
+                last_dim
+            ));
+        }
+
+        if input.device.as_raw() != self.gamma.device.as_raw() {
+            return Err(anyhow!("LayerNorm input and parameters must share the same device"));
+        }
+
+        let rows = input.size() / self.normalized_dim;
+        if rows == 0 {
+            return Err(anyhow!("LayerNorm cannot normalize an empty tensor"));
+        }
+
+        let rows_i32 = i32::try_from(rows)
+            .map_err(|_| anyhow!("LayerNorm input too large for kernel launch"))?;
+        let cols_i32 = i32::try_from(self.normalized_dim)
+            .map_err(|_| anyhow!("LayerNorm normalized dimension too large for kernel launch"))?;
+
+        let mut block_size = 256u32;
+        while block_size > 1 && block_size > self.normalized_dim as u32 {
+            block_size /= 2;
+        }
+        if block_size == 0 {
+            block_size = 1;
+        }
+
+        let grid_size = u32::try_from(rows)
+            .map_err(|_| anyhow!("LayerNorm row count exceeds CUDA grid limits"))?;
+        let shared_bytes =
+            (2 * block_size as usize * std::mem::size_of::<f32>()) as u32;
+
+        let result = Tensor::new(input.shape().to_vec(), &input.device)?;
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+        let module = Module::from_ptx(include_str!("layer_norm_kernel.ptx"), &[])
+            .context("PTX load failed for layer_norm")?;
+        let function = module
+            .get_function("layer_norm_kernel")
+            .context("Kernel load failed for layer_norm")?;
+
+        unsafe {
+            launch!(function<<<grid_size, block_size, shared_bytes, stream>>>(
+                input.data.as_device_ptr(),
+                self.gamma.data.as_device_ptr(),
+                self.beta.data.as_device_ptr(),
+                result.data.as_device_ptr(),
+                rows_i32,
+                cols_i32,
+                self.eps
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .context("Stream sync failed for layer_norm")?;
+
+        Ok(result)
     }
 }
