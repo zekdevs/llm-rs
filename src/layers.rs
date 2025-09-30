@@ -54,7 +54,6 @@ impl Layer for SoftmaxLayer {
     }
 }
 
-
 pub struct MultiHeadAttention {
     embed_dim: usize,
     num_heads: usize,
@@ -605,7 +604,9 @@ impl FeedForwardNetwork {
         activation: ActivationKind,
     ) -> Result<Self> {
         if input_dim == 0 || hidden_dim == 0 {
-            return Err(anyhow!("FeedForwardNetwork dimensions must be greater than zero"));
+            return Err(anyhow!(
+                "FeedForwardNetwork dimensions must be greater than zero"
+            ));
         }
 
         if w1.shape() != &[input_dim, hidden_dim] {
@@ -627,16 +628,17 @@ impl FeedForwardNetwork {
 
         let device_raw = w1.device.as_raw();
         if w2.device.as_raw() != device_raw {
-            return Err(anyhow!("FeedForwardNetwork weights must share the same device"));
+            return Err(anyhow!(
+                "FeedForwardNetwork weights must share the same device"
+            ));
         }
 
-        for (bias, expected) in [
-            (b1.as_ref(), hidden_dim),
-            (b2.as_ref(), input_dim),
-        ] {
+        for (bias, expected) in [(b1.as_ref(), hidden_dim), (b2.as_ref(), input_dim)] {
             if let Some(bias) = bias {
                 if bias.device.as_raw() != device_raw {
-                    return Err(anyhow!("FeedForwardNetwork biases must share the same device"));
+                    return Err(anyhow!(
+                        "FeedForwardNetwork biases must share the same device"
+                    ));
                 }
                 if bias.shape() != &[1, expected] {
                     return Err(anyhow!(
@@ -685,12 +687,12 @@ impl Layer for FeedForwardNetwork {
 
         let rows = input.size() / self.input_dim;
         if rows == 0 {
-            return Err(anyhow!("FeedForwardNetwork cannot process an empty input tensor"));
+            return Err(anyhow!(
+                "FeedForwardNetwork cannot process an empty input tensor"
+            ));
         }
 
-        let flat = input
-            .clone()
-            .reshape(vec![rows, self.input_dim])?;
+        let flat = input.clone().reshape(vec![rows, self.input_dim])?;
 
         let mut hidden = flat.matmul(&self.w1)?;
         if let Some(bias) = &self.b1 {
@@ -750,7 +752,9 @@ impl LayerNorm {
 
     fn assemble(normalized_dim: usize, gamma: Tensor, beta: Tensor, eps: f32) -> Result<Self> {
         if normalized_dim == 0 {
-            return Err(anyhow!("LayerNorm normalized dimension must be greater than zero"));
+            return Err(anyhow!(
+                "LayerNorm normalized dimension must be greater than zero"
+            ));
         }
 
         if gamma.shape() != &[normalized_dim] {
@@ -770,7 +774,9 @@ impl LayerNorm {
         }
 
         if gamma.device.as_raw() != beta.device.as_raw() {
-            return Err(anyhow!("LayerNorm gamma and beta must live on the same device"));
+            return Err(anyhow!(
+                "LayerNorm gamma and beta must live on the same device"
+            ));
         }
 
         Ok(Self {
@@ -785,7 +791,9 @@ impl LayerNorm {
 impl Layer for LayerNorm {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         if input.shape().is_empty() {
-            return Err(anyhow!("LayerNorm expects a tensor with at least one dimension"));
+            return Err(anyhow!(
+                "LayerNorm expects a tensor with at least one dimension"
+            ));
         }
 
         let last_dim = *input.shape().last().unwrap();
@@ -798,7 +806,9 @@ impl Layer for LayerNorm {
         }
 
         if input.device.as_raw() != self.gamma.device.as_raw() {
-            return Err(anyhow!("LayerNorm input and parameters must share the same device"));
+            return Err(anyhow!(
+                "LayerNorm input and parameters must share the same device"
+            ));
         }
 
         let rows = input.size() / self.normalized_dim;
@@ -821,8 +831,7 @@ impl Layer for LayerNorm {
 
         let grid_size = u32::try_from(rows)
             .map_err(|_| anyhow!("LayerNorm row count exceeds CUDA grid limits"))?;
-        let shared_bytes =
-            (2 * block_size as usize * std::mem::size_of::<f32>()) as u32;
+        let shared_bytes = (2 * block_size as usize * std::mem::size_of::<f32>()) as u32;
 
         let result = Tensor::new(input.shape().to_vec(), &input.device)?;
         let stream =

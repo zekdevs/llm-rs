@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use cust::device::Device;
 use cust::memory::DeviceBuffer;
 use cust::module::Module;
@@ -116,7 +116,10 @@ impl Embedding {
             .map_err(|_| anyhow!("Embedding launch exceeds CUDA grid limits"))?;
 
         let indices_buffer = DeviceBuffer::from_slice(indices)?;
-        let result = Tensor::new(vec![batch_size, seq_len, self.embed_dim], &self.weight.device)?;
+        let result = Tensor::new(
+            vec![batch_size, seq_len, self.embed_dim],
+            &self.weight.device,
+        )?;
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
         let module = Module::from_ptx(include_str!("embedding_lookup_kernel.ptx"), &[])
@@ -236,7 +239,9 @@ impl GPTModel {
             return Err(anyhow!("GPTConfig num_layers must be greater than zero"));
         }
         if config.feed_forward_dim == 0 {
-            return Err(anyhow!("GPTConfig feed_forward_dim must be greater than zero"));
+            return Err(anyhow!(
+                "GPTConfig feed_forward_dim must be greater than zero"
+            ));
         }
         if config.layer_norm_eps <= 0.0 {
             return Err(anyhow!("GPTConfig layer_norm_eps must be positive"));
@@ -273,12 +278,12 @@ impl GPTModel {
         })
     }
 
-    pub fn forward(
+    fn forward_internal(
         &self,
         token_indices: &[u32],
         batch_size: usize,
         seq_len: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         if batch_size == 0 {
             return Err(anyhow!("GPTModel forward expects batch_size > 0"));
         }
@@ -304,8 +309,9 @@ impl GPTModel {
             ));
         }
 
-        let token_embeddings =
-            self.token_embedding.forward(token_indices, batch_size, seq_len)?;
+        let token_embeddings = self
+            .token_embedding
+            .forward(token_indices, batch_size, seq_len)?;
 
         let mut position_indices = Vec::with_capacity(expected_tokens);
         for _ in 0..batch_size {
@@ -330,6 +336,25 @@ impl GPTModel {
             logits = logits.add(bias)?;
         }
 
+        Ok((flat_hidden, logits))
+    }
+
+    pub fn forward_with_hidden(
+        &self,
+        token_indices: &[u32],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_internal(token_indices, batch_size, seq_len)
+    }
+
+    pub fn forward(
+        &self,
+        token_indices: &[u32],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        let (_, logits) = self.forward_internal(token_indices, batch_size, seq_len)?;
         logits.reshape(vec![batch_size, seq_len, self.config.vocab_size])
     }
 
@@ -339,5 +364,10 @@ impl GPTModel {
 
     pub fn config(&self) -> &GPTConfig {
         &self.config
+    }
+
+    pub fn lm_head_params_mut(&mut self) -> (&mut Tensor, Option<&mut Tensor>) {
+        let bias = self.lm_head_bias.as_mut().map(|bias| bias as &mut Tensor);
+        (&mut self.lm_head_weight, bias)
     }
 }
