@@ -4,9 +4,9 @@ use cust::memory::DeviceBuffer;
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
-use std::convert::TryFrom;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use std::convert::TryFrom;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -301,8 +301,9 @@ impl GPTModel {
 
     pub fn save_checkpoint<P: AsRef<Path>>(&self, output_dir: P) -> Result<()> {
         let output_dir = output_dir.as_ref();
-        fs::create_dir_all(output_dir)
-            .with_context(|| format!("Failed to create checkpoint directory at {:?}", output_dir))?;
+        fs::create_dir_all(output_dir).with_context(|| {
+            format!("Failed to create checkpoint directory at {:?}", output_dir)
+        })?;
 
         let config_path = output_dir.join("config.json");
         let config_file = File::create(&config_path)

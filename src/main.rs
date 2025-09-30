@@ -8,7 +8,9 @@ use llm_rs::train::{TrainingConfig, train_lm_head_from_text};
 use std::path::{Path, PathBuf};
 
 enum Command {
-    Download { output: PathBuf },
+    Download {
+        output: PathBuf,
+    },
     Train {
         corpus: PathBuf,
         epochs: usize,
@@ -128,8 +130,11 @@ fn run_training(
         seq_len: 128,
         learning_rate: 1e-3,
         epochs,
-        max_sequences_per_epoch: Some(2048),
+        max_sequences_per_epoch: Some(8192),
         shuffle_windows: true,
+        momentum: 0.9,
+        weight_decay: 1e-2,
+        log_every: 100,
     };
     training_config.validate()?;
 

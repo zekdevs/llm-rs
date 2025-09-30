@@ -17,3 +17,6 @@ Cargo.lock
 
 # ignore training data
 *.txt
+
+# ignore training outputs
+checkpoints/

@@ -17,6 +17,9 @@ pub struct TrainingConfig {
     pub epochs: usize,
     pub max_sequences_per_epoch: Option<usize>,
     pub shuffle_windows: bool,
+    pub momentum: f32,
+    pub weight_decay: f32,
+    pub log_every: usize,
 }
 
 impl TrainingConfig {
@@ -35,6 +38,19 @@ impl TrainingConfig {
         if self.epochs == 0 {
             return Err(anyhow!("TrainingConfig epochs must be > 0"));
         }
+        if !(self.momentum.is_finite()) || self.momentum < 0.0 || self.momentum >= 1.0 {
+            return Err(anyhow!(
+                "TrainingConfig momentum must be finite and in [0, 1)"
+            ));
+        }
+        if !(self.weight_decay.is_finite()) || self.weight_decay < 0.0 {
+            return Err(anyhow!(
+                "TrainingConfig weight_decay must be finite and non-negative"
+            ));
+        }
+        if self.log_every == 0 {
+            return Err(anyhow!("TrainingConfig log_every must be > 0"));
+        }
         Ok(())
     }
 }
@@ -48,6 +64,9 @@ impl Default for TrainingConfig {
             epochs: 1,
             max_sequences_per_epoch: Some(1024),
             shuffle_windows: true,
+            momentum: 0.9,
+            weight_decay: 1e-2,
+            log_every: 100,
         }
     }
 }
@@ -60,6 +79,186 @@ pub struct TrainingReport {
     pub tokens_per_epoch: Vec<usize>,
     pub total_batches: usize,
     pub total_tokens: usize,
+}
+
+struct LmHeadOptimizer {
+    learning_rate: f32,
+    momentum: f32,
+    weight_decay: f32,
+    embed_dim: usize,
+    vocab_size: usize,
+    grad_logits: Vec<f32>,
+    grad_weight: Vec<f32>,
+    grad_bias: Vec<f32>,
+    velocity_weight: Vec<f32>,
+    velocity_bias: Vec<f32>,
+}
+
+impl LmHeadOptimizer {
+    fn new(embed_dim: usize, vocab_size: usize, has_bias: bool, config: &TrainingConfig) -> Self {
+        let weight_elems = embed_dim
+            .checked_mul(vocab_size)
+            .expect("lm_head shape overflow");
+        let bias_elems = if has_bias { vocab_size } else { 0 };
+
+        Self {
+            learning_rate: config.learning_rate,
+            momentum: config.momentum,
+            weight_decay: config.weight_decay,
+            embed_dim,
+            vocab_size,
+            grad_logits: Vec::new(),
+            grad_weight: vec![0.0; weight_elems],
+            grad_bias: vec![0.0; bias_elems],
+            velocity_weight: vec![0.0; weight_elems],
+            velocity_bias: vec![0.0; bias_elems],
+        }
+    }
+
+    fn step(
+        &mut self,
+        model: &mut GPTModel,
+        hidden: Tensor,
+        logits: Tensor,
+        targets: &[u32],
+    ) -> Result<f32> {
+        if hidden.shape().len() != 2 || logits.shape().len() != 2 {
+            return Err(anyhow!("Expected 2D tensors for hidden states and logits"));
+        }
+
+        let batch_seq = hidden.shape()[0];
+        let embed_dim = hidden.shape()[1];
+        let logits_rows = logits.shape()[0];
+        let vocab_size = logits.shape()[1];
+
+        if logits_rows != batch_seq {
+            return Err(anyhow!(
+                "Hidden state count ({}) must match logits rows ({})",
+                batch_seq,
+                logits_rows
+            ));
+        }
+        if embed_dim != self.embed_dim {
+            return Err(anyhow!(
+                "Hidden dimension {} does not match lm_head embed_dim {}",
+                embed_dim,
+                self.embed_dim
+            ));
+        }
+        if vocab_size != self.vocab_size {
+            return Err(anyhow!(
+                "Logit vocab {} does not match lm_head vocab_size {}",
+                vocab_size,
+                self.vocab_size
+            ));
+        }
+        if targets.len() != batch_seq {
+            return Err(anyhow!(
+                "Target length {} does not match batch*seq {}",
+                targets.len(),
+                batch_seq
+            ));
+        }
+
+        let hidden_host = hidden.to_host()?;
+        let logits_host = logits.to_host()?;
+
+        let grad_logits_len = batch_seq
+            .checked_mul(vocab_size)
+            .ok_or_else(|| anyhow!("Gradient buffer overflow"))?;
+        self.grad_logits.resize(grad_logits_len, 0.0);
+        for value in &mut self.grad_logits {
+            *value = 0.0;
+        }
+        for value in &mut self.grad_weight {
+            *value = 0.0;
+        }
+        for value in &mut self.grad_bias {
+            *value = 0.0;
+        }
+
+        let mut loss_acc = 0f32;
+        let inv_batch = 1.0f32 / (batch_seq as f32);
+
+        for i in 0..batch_seq {
+            let offset = i * vocab_size;
+            let slice = &logits_host[offset..offset + vocab_size];
+            let target_idx = usize::try_from(targets[i])
+                .map_err(|_| anyhow!("Target token index {} does not fit in usize", targets[i]))?;
+            if target_idx >= vocab_size {
+                return Err(anyhow!(
+                    "Target token {} exceeds vocabulary size {}",
+                    target_idx,
+                    vocab_size
+                ));
+            }
+
+            let max_logit = slice
+                .iter()
+                .fold(f32::NEG_INFINITY, |acc, &val| acc.max(val));
+            let mut sum_exp = 0f32;
+            for &logit in slice {
+                sum_exp += (logit - max_logit).exp();
+            }
+            let log_sum = sum_exp.ln();
+            loss_acc += -(slice[target_idx] - max_logit) + log_sum;
+
+            for j in 0..vocab_size {
+                let prob = (slice[j] - max_logit).exp() / sum_exp;
+                let indicator = if j == target_idx { 1.0 } else { 0.0 };
+                self.grad_logits[offset + j] = (prob - indicator) * inv_batch;
+            }
+        }
+
+        loss_acc /= batch_seq as f32;
+
+        for i in 0..batch_seq {
+            let hidden_row = &hidden_host[i * embed_dim..(i + 1) * embed_dim];
+            let grad_row = &self.grad_logits[i * vocab_size..(i + 1) * vocab_size];
+
+            for j in 0..vocab_size {
+                let grad = grad_row[j];
+                if !self.grad_bias.is_empty() {
+                    self.grad_bias[j] += grad;
+                }
+                if grad == 0.0 {
+                    continue;
+                }
+
+                let mut weight_offset = j;
+                for &hidden_val in hidden_row {
+                    self.grad_weight[weight_offset] += hidden_val * grad;
+                    weight_offset += vocab_size;
+                }
+            }
+        }
+
+        let (weight_tensor, bias_tensor_opt) = model.lm_head_params_mut();
+        let mut weight_host = weight_tensor.to_host()?;
+
+        for (idx, w) in weight_host.iter_mut().enumerate() {
+            let grad = self.grad_weight[idx] + self.weight_decay * *w;
+            let velocity = self.momentum * self.velocity_weight[idx] + grad;
+            self.velocity_weight[idx] = velocity;
+            *w -= self.learning_rate * velocity;
+        }
+        weight_tensor.copy_from_host(&weight_host)?;
+
+        if let Some(bias_tensor) = bias_tensor_opt {
+            if !self.grad_bias.is_empty() {
+                let mut bias_host = bias_tensor.to_host()?;
+                for (idx, b) in bias_host.iter_mut().enumerate() {
+                    let grad = self.grad_bias[idx];
+                    let velocity = self.momentum * self.velocity_bias[idx] + grad;
+                    self.velocity_bias[idx] = velocity;
+                    *b -= self.learning_rate * velocity;
+                }
+                bias_tensor.copy_from_host(&bias_host)?;
+            }
+        }
+
+        Ok(loss_acc)
+    }
 }
 
 /// Load a UTF-8 text corpus from disk and tokenize it into a flat token stream.
@@ -127,6 +326,21 @@ pub fn train_lm_head_from_text(
     let mut total_batches = 0usize;
     let mut total_tokens = 0usize;
 
+    let (embed_dim, vocab_size, has_bias) = {
+        let (weight_tensor, bias_tensor_opt) = model.lm_head_params_mut();
+        if weight_tensor.shape().len() != 2 {
+            return Err(anyhow!(
+                "LM head weight must be 2D, found shape {:?}",
+                weight_tensor.shape()
+            ));
+        }
+        let embed_dim = weight_tensor.shape()[0];
+        let vocab_size = weight_tensor.shape()[1];
+        let has_bias = bias_tensor_opt.is_some();
+        (embed_dim, vocab_size, has_bias)
+    };
+    let mut optimizer = LmHeadOptimizer::new(embed_dim, vocab_size, has_bias, config);
+
     for _epoch in 0..config.epochs {
         let mut positions: Vec<usize> = (0..=window_limit).collect();
         if config.shuffle_windows {
@@ -159,13 +373,17 @@ pub fn train_lm_head_from_text(
 
             let (hidden, logits) =
                 model.forward_with_hidden(&inputs, config.batch_size, config.seq_len)?;
-            let batch_loss = sgd_step(model, hidden, logits, &targets, config.learning_rate)?;
+            let batch_loss = optimizer.step(model, hidden, logits, &targets)?;
 
             epoch_loss_acc += batch_loss;
             epoch_batches += 1;
             total_batches += 1;
             epoch_tokens += config.batch_size * config.seq_len;
             total_tokens += config.batch_size * config.seq_len;
+
+            if total_batches % config.log_every == 0 {
+                println!("  batch {:>5} | loss {:.6}", total_batches, batch_loss);
+            }
         }
 
         if epoch_batches == 0 {
@@ -186,113 +404,4 @@ pub fn train_lm_head_from_text(
         total_batches,
         total_tokens,
     })
-}
-
-fn sgd_step(
-    model: &mut GPTModel,
-    hidden: Tensor,
-    logits: Tensor,
-    targets: &[u32],
-    learning_rate: f32,
-) -> Result<f32> {
-    if hidden.shape().len() != 2 || logits.shape().len() != 2 {
-        return Err(anyhow!("Expected 2D tensors for hidden states and logits"));
-    }
-
-    let batch_seq = hidden.shape()[0];
-    let embed_dim = hidden.shape()[1];
-    let vocab_size = logits.shape()[1];
-
-    if logits.shape()[0] != batch_seq {
-        return Err(anyhow!(
-            "Hidden state count ({}) must match logits rows ({})",
-            batch_seq,
-            logits.shape()[0]
-        ));
-    }
-
-    if targets.len() != batch_seq {
-        return Err(anyhow!(
-            "Target length {} does not match batch*seq {}",
-            targets.len(),
-            batch_seq
-        ));
-    }
-
-    let hidden_host = hidden.to_host()?;
-    let logits_host = logits.to_host()?;
-    let mut grad_logits = vec![0f32; logits_host.len()];
-    let mut loss_acc = 0f32;
-    let inv_batch = 1.0f32 / (batch_seq as f32);
-
-    for i in 0..batch_seq {
-        let offset = i * vocab_size;
-        let slice = &logits_host[offset..offset + vocab_size];
-        let target_idx = usize::try_from(targets[i])
-            .map_err(|_| anyhow!("Target token index {} does not fit in usize", targets[i]))?;
-        if target_idx >= vocab_size {
-            return Err(anyhow!(
-                "Target token {} exceeds vocabulary size {}",
-                target_idx,
-                vocab_size
-            ));
-        }
-
-        let max_logit = slice
-            .iter()
-            .fold(f32::NEG_INFINITY, |acc, &val| acc.max(val));
-        let mut sum_exp = 0f32;
-        for &logit in slice {
-            sum_exp += (logit - max_logit).exp();
-        }
-        let log_sum = sum_exp.ln();
-        loss_acc += -(slice[target_idx] - max_logit) + log_sum;
-
-        for j in 0..vocab_size {
-            let prob = (slice[j] - max_logit).exp() / sum_exp;
-            let indicator = if j == target_idx { 1.0 } else { 0.0 };
-            grad_logits[offset + j] = (prob - indicator) * inv_batch;
-        }
-    }
-
-    loss_acc /= batch_seq as f32;
-
-    let mut grad_weight = vec![0f32; embed_dim * vocab_size];
-    let mut grad_bias = vec![0f32; vocab_size];
-
-    for i in 0..batch_seq {
-        let hidden_row = &hidden_host[i * embed_dim..(i + 1) * embed_dim];
-        let grad_row = &grad_logits[i * vocab_size..(i + 1) * vocab_size];
-
-        for j in 0..vocab_size {
-            let grad = grad_row[j];
-            grad_bias[j] += grad;
-            if grad == 0.0 {
-                continue;
-            }
-
-            let mut weight_offset = j;
-            for &hidden_val in hidden_row {
-                grad_weight[weight_offset] += hidden_val * grad;
-                weight_offset += vocab_size;
-            }
-        }
-    }
-
-    let (weight_tensor, bias_tensor_opt) = model.lm_head_params_mut();
-    let mut weight_host = weight_tensor.to_host()?;
-    for (w, grad) in weight_host.iter_mut().zip(grad_weight.iter()) {
-        *w -= learning_rate * grad;
-    }
-    weight_tensor.copy_from_host(&weight_host)?;
-
-    if let Some(bias_tensor) = bias_tensor_opt {
-        let mut bias_host = bias_tensor.to_host()?;
-        for (b, grad) in bias_host.iter_mut().zip(grad_bias.iter()) {
-            *b -= learning_rate * grad;
-        }
-        bias_tensor.copy_from_host(&bias_host)?;
-    }
-
-    Ok(loss_acc)
 }

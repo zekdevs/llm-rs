@@ -3,8 +3,8 @@ use cust::device::Device;
 use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
-use std::convert::TryFrom;
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 
 use crate::tensor::Tensor;
 

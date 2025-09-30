@@ -32,7 +32,7 @@ The default binary now performs a lightweight SGD step that updates only the lan
 cargo run --release -- ./textbooks.txt 3 --save ./checkpoints/baseline
 ```
 
-The training loop emits per-epoch average loss alongside aggregate token and batch counts. It uses only the dependencies listed in `Cargo.toml`.
+The training loop uses momentum SGD with weight decay, a the token budget per epoch (8k by default), and logs running loss every 100 batches so you can monitor convergence. It uses only the dependencies listed in `Cargo.toml`.
 
 ### Exporting checkpoints
 
