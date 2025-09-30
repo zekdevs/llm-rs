@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 
 enum Command {
     Download { output: PathBuf },
-    Train { corpus: PathBuf, epochs: usize },
+    Train {
+        corpus: PathBuf,
+        epochs: usize,
+        save_dir: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -28,11 +32,15 @@ fn run() -> Result<()> {
             println!("Dataset downloaded to {}", output.display());
             Ok(())
         }
-        Command::Train { corpus, epochs } => {
+        Command::Train {
+            corpus,
+            epochs,
+            save_dir,
+        } => {
             let _context = cust::quick_init().context("Failed to initialise CUDA")?;
             let device = Device::get_device(0).context("Failed to acquire CUDA device 0")?;
 
-            run_training(&device, corpus.as_path(), epochs)
+            run_training(&device, corpus.as_path(), epochs, save_dir.as_deref())
         }
     }
 }
@@ -40,7 +48,9 @@ fn run() -> Result<()> {
 fn parse_command(args: &[String]) -> Result<Command> {
     let mut iter = args.iter().skip(1);
     let first = iter.next().ok_or_else(|| {
-        anyhow!("Usage: cargo run -- <download <output.txt> | <path/to/corpus.txt> [epochs]>")
+        anyhow!(
+            "Usage: cargo run -- <download <output.txt> | <path/to/corpus.txt> [epochs] [--save <dir>] >"
+        )
     })?;
 
     if first == "download" {
@@ -57,22 +67,60 @@ fn parse_command(args: &[String]) -> Result<Command> {
         })
     } else {
         let corpus = PathBuf::from(first);
-        let epochs = match iter.next() {
-            Some(value) => value
-                .parse::<usize>()
-                .context("Could not parse epochs argument as usize")?,
-            None => 1,
-        };
-        if iter.next().is_some() {
-            return Err(anyhow!(
-                "Unexpected additional arguments after epochs value"
-            ));
+        let remaining: Vec<&String> = iter.collect();
+        let mut idx = 0usize;
+
+        let mut epochs = 1usize;
+        let mut epochs_set = false;
+        let mut save_dir = None;
+
+        if idx < remaining.len() {
+            if let Ok(parsed) = remaining[idx].parse::<usize>() {
+                epochs = parsed;
+                epochs_set = true;
+                idx += 1;
+            }
         }
-        Ok(Command::Train { corpus, epochs })
+
+        while idx < remaining.len() {
+            match remaining[idx].as_str() {
+                "--save" => {
+                    idx += 1;
+                    let path = remaining
+                        .get(idx)
+                        .ok_or_else(|| anyhow!("--save flag requires a directory argument"))?;
+                    save_dir = Some(PathBuf::from(path));
+                    idx += 1;
+                }
+                value if !epochs_set => {
+                    epochs = value
+                        .parse::<usize>()
+                        .context("Could not parse epochs argument as usize")?;
+                    epochs_set = true;
+                    idx += 1;
+                }
+                unexpected => {
+                    return Err(anyhow!(
+                        "Unexpected argument '{}' after corpus path",
+                        unexpected
+                    ));
+                }
+            }
+        }
+        Ok(Command::Train {
+            corpus,
+            epochs,
+            save_dir,
+        })
     }
 }
 
-fn run_training(device: &Device, corpus_path: &Path, epochs: usize) -> Result<()> {
+fn run_training(
+    device: &Device,
+    corpus_path: &Path,
+    epochs: usize,
+    save_dir: Option<&Path>,
+) -> Result<()> {
     let tokenizer = Tokenizer::new();
 
     let training_config = TrainingConfig {
@@ -117,6 +165,16 @@ fn run_training(device: &Device, corpus_path: &Path, epochs: usize) -> Result<()
         "Summary | total batches {:>4} | total tokens {:>8}",
         report.total_batches, report.total_tokens
     );
+
+    if let Some(dir) = save_dir {
+        model
+            .save_checkpoint(dir)
+            .with_context(|| format!("Failed to export checkpoint to {:?}", dir))?;
+        println!(
+            "Checkpoint saved to {:?} (config.json + model.safetensors)",
+            dir
+        );
+    }
 
     Ok(())
 }

@@ -4,6 +4,7 @@ use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::convert::TryFrom;
+use serde::{Deserialize, Serialize};
 
 use crate::tensor::Tensor;
 
@@ -11,7 +12,8 @@ pub trait Layer {
     fn forward(&self, input: &Tensor) -> Result<Tensor>;
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ActivationKind {
     Relu,
 }
@@ -455,6 +457,26 @@ impl MultiHeadAttention {
             .context("Stream sync failed for apply_attention")?;
         Ok(result)
     }
+
+    pub fn append_named_tensors<'a>(&'a self, prefix: &str, out: &mut Vec<(String, &'a Tensor)>) {
+        out.push((format!("{prefix}.w_q"), &self.w_q));
+        out.push((format!("{prefix}.w_k"), &self.w_k));
+        out.push((format!("{prefix}.w_v"), &self.w_v));
+        out.push((format!("{prefix}.w_o"), &self.w_o));
+
+        if let Some(bias) = &self.b_q {
+            out.push((format!("{prefix}.b_q"), bias));
+        }
+        if let Some(bias) = &self.b_k {
+            out.push((format!("{prefix}.b_k"), bias));
+        }
+        if let Some(bias) = &self.b_v {
+            out.push((format!("{prefix}.b_v"), bias));
+        }
+        if let Some(bias) = &self.b_o {
+            out.push((format!("{prefix}.b_o"), bias));
+        }
+    }
 }
 
 impl Layer for MultiHeadAttention {
@@ -660,6 +682,17 @@ impl FeedForwardNetwork {
             activation,
         })
     }
+
+    pub fn append_named_tensors<'a>(&'a self, prefix: &str, out: &mut Vec<(String, &'a Tensor)>) {
+        out.push((format!("{prefix}.w1"), &self.w1));
+        out.push((format!("{prefix}.w2"), &self.w2));
+        if let Some(bias) = &self.b1 {
+            out.push((format!("{prefix}.b1"), bias));
+        }
+        if let Some(bias) = &self.b2 {
+            out.push((format!("{prefix}.b2"), bias));
+        }
+    }
 }
 
 impl Layer for FeedForwardNetwork {
@@ -785,6 +818,11 @@ impl LayerNorm {
             beta,
             eps,
         })
+    }
+
+    pub fn append_named_tensors<'a>(&'a self, prefix: &str, out: &mut Vec<(String, &'a Tensor)>) {
+        out.push((format!("{prefix}.gamma"), &self.gamma));
+        out.push((format!("{prefix}.beta"), &self.beta));
     }
 }
 

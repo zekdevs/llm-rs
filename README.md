@@ -26,13 +26,20 @@ single paragraph per line. Point the training binary at the resulting
 
 ## Training entry point
 
-The default binary now performs a lightweight SGD step that updates only the language-model head while the rest of the transformer remains frozen. Provide the corpus path and optionally the number of epochs:
+The default binary now performs a lightweight SGD step that updates only the language-model head while the rest of the transformer remains frozen. Provide the corpus path and optionally the number of epochs. Pass `--save <dir>` to export the trained weights:
 
 ```bash
-cargo run --release -- ./textbooks.txt 3
+cargo run --release -- ./textbooks.txt 3 --save ./checkpoints/baseline
 ```
 
 The training loop emits per-epoch average loss alongside aggregate token and batch counts. It uses only the dependencies listed in `Cargo.toml`.
+
+### Exporting checkpoints
+
+When `--save` is set the binary ensures the directory exists and writes two files compatible with Hugging Face uploads:
+
+- `config.json` – serialized `GPTConfig`
+- `model.safetensors` – parameter tensors in the [safetensors](https://github.com/huggingface/safetensors) format
 
 ## Notes and next steps
 

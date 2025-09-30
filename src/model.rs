@@ -5,6 +5,11 @@ use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use std::convert::TryFrom;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 use crate::layers::{ActivationKind, FeedForwardNetwork, Layer, LayerNorm, MultiHeadAttention};
 use crate::tensor::Tensor;
@@ -61,6 +66,10 @@ impl Embedding {
             vocab_size,
             embed_dim,
         })
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
     }
 
     pub fn forward(&self, indices: &[u32], batch_size: usize, seq_len: usize) -> Result<Tensor> {
@@ -183,6 +192,18 @@ impl TransformerBlock {
             feed_forward,
         })
     }
+
+    fn append_named_tensors<'a>(&'a self, index: usize, out: &mut Vec<(String, &'a Tensor)>) {
+        let prefix = format!("blocks.{index}");
+        self.attention
+            .append_named_tensors(&format!("{prefix}.attention"), out);
+        self.norm_1
+            .append_named_tensors(&format!("{prefix}.norm_1"), out);
+        self.norm_2
+            .append_named_tensors(&format!("{prefix}.norm_2"), out);
+        self.feed_forward
+            .append_named_tensors(&format!("{prefix}.mlp"), out);
+    }
 }
 
 impl Layer for TransformerBlock {
@@ -198,7 +219,7 @@ impl Layer for TransformerBlock {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GPTConfig {
     pub vocab_size: usize,
     pub max_seq_len: usize,
@@ -276,6 +297,108 @@ impl GPTModel {
             lm_head_weight,
             lm_head_bias,
         })
+    }
+
+    pub fn save_checkpoint<P: AsRef<Path>>(&self, output_dir: P) -> Result<()> {
+        let output_dir = output_dir.as_ref();
+        fs::create_dir_all(output_dir)
+            .with_context(|| format!("Failed to create checkpoint directory at {:?}", output_dir))?;
+
+        let config_path = output_dir.join("config.json");
+        let config_file = File::create(&config_path)
+            .with_context(|| format!("Failed to create {:?}", config_path))?;
+        serde_json::to_writer_pretty(config_file, &self.config)
+            .context("Failed to write checkpoint config")?;
+
+        let mut tensors: Vec<(String, &Tensor)> = Vec::new();
+        tensors.push((
+            "token_embedding.weight".to_string(),
+            self.token_embedding.weight(),
+        ));
+        tensors.push((
+            "position_embedding.weight".to_string(),
+            self.position_embedding.weight(),
+        ));
+
+        for (idx, block) in self.blocks.iter().enumerate() {
+            block.append_named_tensors(idx, &mut tensors);
+        }
+
+        self.final_norm
+            .append_named_tensors("final_norm", &mut tensors);
+        tensors.push(("lm_head.weight".to_string(), &self.lm_head_weight));
+        if let Some(bias) = &self.lm_head_bias {
+            tensors.push(("lm_head.bias".to_string(), bias));
+        }
+
+        let safetensors_path = output_dir.join("model.safetensors");
+        let mut header = JsonMap::new();
+        let mut offset_bytes: u64 = 0;
+
+        for (name, tensor) in &tensors {
+            let num_elements = tensor.size() as u64;
+            let byte_len = num_elements
+                .checked_mul(4)
+                .ok_or_else(|| anyhow!("Tensor {name} is too large for safetensors export"))?;
+
+            let mut entry = JsonMap::new();
+            entry.insert("dtype".to_string(), JsonValue::String("F32".to_string()));
+
+            let shape_values = tensor
+                .shape()
+                .iter()
+                .map(|&dim| JsonValue::Number(JsonNumber::from(dim as u64)))
+                .collect();
+            entry.insert("shape".to_string(), JsonValue::Array(shape_values));
+
+            entry.insert(
+                "data_offsets".to_string(),
+                JsonValue::Array(vec![
+                    JsonValue::Number(JsonNumber::from(offset_bytes)),
+                    JsonValue::Number(JsonNumber::from(
+                        offset_bytes
+                            .checked_add(byte_len)
+                            .ok_or_else(|| anyhow!("Tensor {name} offset overflow"))?,
+                    )),
+                ]),
+            );
+
+            header.insert(name.clone(), JsonValue::Object(entry));
+            offset_bytes = offset_bytes
+                .checked_add(byte_len)
+                .ok_or_else(|| anyhow!("Checkpoint size overflow"))?;
+        }
+
+        let header_bytes = serde_json::to_vec(&JsonValue::Object(header))
+            .context("Failed to encode safetensors header")?;
+
+        let mut writer = BufWriter::new(
+            File::create(&safetensors_path)
+                .with_context(|| format!("Failed to create {:?}", safetensors_path))?,
+        );
+
+        let header_len = header_bytes.len() as u64;
+        writer
+            .write_all(&header_len.to_le_bytes())
+            .context("Failed to write safetensors header length")?;
+        writer
+            .write_all(&header_bytes)
+            .context("Failed to write safetensors header")?;
+
+        for (name, tensor) in &tensors {
+            let host_data = tensor
+                .to_host()
+                .with_context(|| format!("Failed to copy tensor {name} to host"))?;
+            for value in host_data {
+                writer
+                    .write_all(&value.to_le_bytes())
+                    .with_context(|| format!("Failed to write tensor data for {name}"))?;
+            }
+        }
+
+        writer.flush().context("Failed to flush safetensors file")?;
+
+        Ok(())
     }
 
     fn forward_internal(
