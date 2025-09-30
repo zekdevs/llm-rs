@@ -21,6 +21,8 @@ fn main() {
         ("merge_heads_kernel.cu", "merge_heads_kernel.ptx"),
         ("attention_scores_kernel.cu", "attention_scores_kernel.ptx"),
         ("apply_attention_kernel.cu", "apply_attention_kernel.ptx"),
+        ("layer_norm_kernel.cu", "layer_norm_kernel.ptx"),
+        ("embedding_lookup_kernel.cu", "embedding_lookup_kernel.ptx"),
     ];
 
     for (cu_file, ptx_file) in kernels {

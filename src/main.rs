@@ -1,4 +1,5 @@
 mod layers;
+mod model;
 mod tensor;
 
 fn main() {
