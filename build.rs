@@ -23,6 +23,8 @@ fn main() {
         ("apply_attention_kernel.cu", "apply_attention_kernel.ptx"),
         ("layer_norm_kernel.cu", "layer_norm_kernel.ptx"),
         ("embedding_lookup_kernel.cu", "embedding_lookup_kernel.ptx"),
+        ("cross_entropy_kernel.cu", "cross_entropy_kernel.ptx"),
+        ("transpose_kernel.cu", "transpose_kernel.ptx"),
     ];
 
     for (cu_file, ptx_file) in kernels {

@@ -1,7 +1,7 @@
+use crate::kernel_cache;
 use anyhow::{Context, Result, anyhow};
 use cust::device::Device;
 use cust::memory::DeviceBuffer;
-use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,14 @@ impl Embedding {
         &self.weight
     }
 
+    pub fn visit_parameters_mut<F>(&mut self, prefix: &str, f: &mut F) -> Result<()>
+    where
+        F: FnMut(&str, &mut Tensor) -> Result<()>,
+    {
+        f(&format!("{prefix}.weight"), &mut self.weight)?;
+        Ok(())
+    }
+
     pub fn forward(&self, indices: &[u32], batch_size: usize, seq_len: usize) -> Result<Tensor> {
         if batch_size == 0 {
             return Err(anyhow!("Embedding forward expects batch_size > 0"));
@@ -131,8 +139,10 @@ impl Embedding {
         )?;
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
-        let module = Module::from_ptx(include_str!("embedding_lookup_kernel.ptx"), &[])
-            .context("PTX load failed for embedding_lookup")?;
+        let module = kernel_cache::module(
+            include_str!("embedding_lookup_kernel.ptx"),
+            "embedding_lookup",
+        )?;
         let function = module
             .get_function("embedding_lookup_kernel")
             .context("Kernel load failed for embedding_lookup")?;
@@ -203,6 +213,22 @@ impl TransformerBlock {
             .append_named_tensors(&format!("{prefix}.norm_2"), out);
         self.feed_forward
             .append_named_tensors(&format!("{prefix}.mlp"), out);
+    }
+
+    fn visit_parameters_mut<F>(&mut self, index: usize, f: &mut F) -> Result<()>
+    where
+        F: FnMut(&str, &mut Tensor) -> Result<()>,
+    {
+        let prefix = format!("blocks.{index}");
+        self.attention
+            .visit_parameters_mut(&format!("{prefix}.attention"), f)?;
+        self.norm_1
+            .visit_parameters_mut(&format!("{prefix}.norm_1"), f)?;
+        self.norm_2
+            .visit_parameters_mut(&format!("{prefix}.norm_2"), f)?;
+        self.feed_forward
+            .visit_parameters_mut(&format!("{prefix}.mlp"), f)?;
+        Ok(())
     }
 }
 
@@ -493,5 +519,28 @@ impl GPTModel {
     pub fn lm_head_params_mut(&mut self) -> (&mut Tensor, Option<&mut Tensor>) {
         let bias = self.lm_head_bias.as_mut().map(|bias| bias as &mut Tensor);
         (&mut self.lm_head_weight, bias)
+    }
+
+    pub fn visit_parameters_mut<F>(&mut self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str, &mut Tensor) -> Result<()>,
+    {
+        self.token_embedding
+            .visit_parameters_mut("token_embedding", &mut f)?;
+        self.position_embedding
+            .visit_parameters_mut("position_embedding", &mut f)?;
+
+        for (idx, block) in self.blocks.iter_mut().enumerate() {
+            block.visit_parameters_mut(idx, &mut f)?;
+        }
+
+        self.final_norm.visit_parameters_mut("final_norm", &mut f)?;
+
+        f("lm_head.weight", &mut self.lm_head_weight)?;
+        if let Some(bias) = &mut self.lm_head_bias {
+            f("lm_head.bias", bias)?;
+        }
+
+        Ok(())
     }
 }

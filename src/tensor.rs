@@ -1,6 +1,6 @@
+use crate::kernel_cache;
 use anyhow::{Context, Result, anyhow};
 use cust::memory::DeviceBuffer;
-use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use rand::prelude::*;
@@ -159,8 +159,7 @@ impl Tensor {
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
 
-        let module = Module::from_ptx(include_str!("matmul_kernel.ptx"), &[])
-            .context("PTX load failed for matmul")?;
+        let module = kernel_cache::module(include_str!("matmul_kernel.ptx"), "matmul")?;
         let function = module
             .get_function("matmul_kernel")
             .context("Kernel load failed for matmul")?;
@@ -217,8 +216,7 @@ impl Tensor {
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
 
-        let module = Module::from_ptx(kernel.ptx_source, &[])
-            .with_context(|| format!("PTX load failed for {}", kernel.human_name))?;
+        let module = kernel_cache::module(kernel.ptx_source, kernel.function_name)?;
         let function = module
             .get_function(kernel.function_name)
             .with_context(|| format!("Kernel load failed for {}", kernel.human_name))?;
@@ -290,8 +288,7 @@ impl Tensor {
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
 
-        let module = Module::from_ptx(include_str!("add_scalar_kernel.ptx"), &[])
-            .context("PTX load failed for add_scalar")?;
+        let module = kernel_cache::module(include_str!("add_scalar_kernel.ptx"), "add_scalar")?;
         let function = module
             .get_function("add_scalar_kernel")
             .context("Kernel load failed for add_scalar")?;
@@ -380,8 +377,7 @@ impl Tensor {
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
 
-        let module = Module::from_ptx(kernel.ptx_source, &[])
-            .with_context(|| format!("PTX load failed for {}", kernel.human_name))?;
+        let module = kernel_cache::module(kernel.ptx_source, kernel.function_name)?;
         let function = module
             .get_function(kernel.function_name)
             .with_context(|| format!("Kernel load failed for {}", kernel.human_name))?;
@@ -428,6 +424,61 @@ impl Tensor {
         )
     }
 
+    /// Transposes a 2D tensor.
+    pub fn transpose2d(&self) -> Result<Tensor> {
+        if self.shape.len() != 2 {
+            return Err(anyhow!(
+                "transpose2d expects a 2D tensor, but received shape {:?}",
+                self.shape
+            ));
+        }
+
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+
+        let result = Tensor::new(vec![cols, rows], &self.device)?;
+        let block = (16u32, 16u32, 1u32);
+        let grid_x = ((cols as u32) + block.0 - 1) / block.0;
+        let grid_y = ((rows as u32) + block.1 - 1) / block.1;
+        let grid = (grid_x, grid_y, 1u32);
+
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+        let module = kernel_cache::module(include_str!("transpose_kernel.ptx"), "transpose2d")?;
+        let function = module
+            .get_function("transpose2d_kernel")
+            .context("Kernel load failed for transpose2d")?;
+
+        unsafe {
+            launch!(function<<<grid, block, 0, stream>>>(
+                self.data.as_device_ptr(),
+                result.data.as_device_ptr(),
+                rows as i32,
+                cols as i32
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .context("Stream sync failed for transpose2d")?;
+
+        Ok(result)
+    }
+
+    /// Computes the sum across the last dimension for each row of a 2D tensor.
+    pub fn sum_rows(&self) -> Result<Tensor> {
+        if self.shape.len() != 2 {
+            return Err(anyhow!(
+                "sum_rows expects a 2D tensor, but received shape {:?}",
+                self.shape
+            ));
+        }
+
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+        self.rowwise_sum(rows, cols)
+    }
+
     fn rowwise_reduce(&self, kernel: KernelSpec, rows: usize, cols: usize) -> Result<Tensor> {
         if rows == 0 || cols == 0 {
             return Err(anyhow!(
@@ -450,8 +501,7 @@ impl Tensor {
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
 
-        let module = Module::from_ptx(kernel.ptx_source, &[])
-            .with_context(|| format!("PTX load failed for {}", kernel.human_name))?;
+        let module = kernel_cache::module(kernel.ptx_source, kernel.function_name)?;
         let function = module
             .get_function(kernel.function_name)
             .with_context(|| format!("Kernel load failed for {}", kernel.human_name))?;

@@ -125,16 +125,51 @@ fn run_training(
 ) -> Result<()> {
     let tokenizer = Tokenizer::new();
 
+    let use_spsa = std::env::var("LLM_RS_USE_SPSA")
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
+    let spsa_lr = match std::env::var("LLM_RS_SPSA_LR") {
+        Ok(value) => Some(
+            value
+                .parse::<f32>()
+                .with_context(|| "Failed to parse LLM_RS_SPSA_LR as f32")?,
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => {
+            return Err(anyhow!("Failed to read LLM_RS_SPSA_LR: {err}"));
+        }
+    };
+
+    let spsa_eps = match std::env::var("LLM_RS_SPSA_EPS") {
+        Ok(value) => Some(
+            value
+                .parse::<f32>()
+                .with_context(|| "Failed to parse LLM_RS_SPSA_EPS as f32")?,
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => {
+            return Err(anyhow!("Failed to read LLM_RS_SPSA_EPS: {err}"));
+        }
+    };
+
+    let base_learning_rate = 1e-3;
+    let base_spsa_learning_rate = spsa_lr.unwrap_or(base_learning_rate);
+    let base_spsa_epsilon = spsa_eps.unwrap_or(1e-3);
+
     let training_config = TrainingConfig {
         batch_size: 4,
         seq_len: 128,
-        learning_rate: 1e-3,
+        learning_rate: base_learning_rate,
         epochs,
         max_sequences_per_epoch: Some(8192),
         shuffle_windows: true,
         momentum: 0.9,
         weight_decay: 1e-2,
         log_every: 100,
+        use_spsa,
+        spsa_learning_rate: base_spsa_learning_rate,
+        spsa_epsilon: base_spsa_epsilon,
     };
     training_config.validate()?;
 

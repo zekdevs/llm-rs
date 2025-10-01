@@ -1,6 +1,6 @@
+use crate::kernel_cache;
 use anyhow::{Context, Result, anyhow};
 use cust::device::Device;
-use cust::module::Module;
 use cust::prelude::*;
 use cust::stream::{Stream, StreamFlags};
 use serde::{Deserialize, Serialize};
@@ -235,8 +235,7 @@ impl MultiHeadAttention {
         let grid_size = ((total as u32) + block_size - 1) / block_size;
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
-        let module = Module::from_ptx(include_str!("split_heads_kernel.ptx"), &[])
-            .context("PTX load failed for split_heads")?;
+        let module = kernel_cache::module(include_str!("split_heads_kernel.ptx"), "split_heads")?;
         let function = module
             .get_function("split_heads_kernel")
             .context("Kernel load failed for split_heads")?;
@@ -290,8 +289,7 @@ impl MultiHeadAttention {
         let grid_size = ((total as u32) + block_size - 1) / block_size;
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
-        let module = Module::from_ptx(include_str!("merge_heads_kernel.ptx"), &[])
-            .context("PTX load failed for merge_heads")?;
+        let module = kernel_cache::module(include_str!("merge_heads_kernel.ptx"), "merge_heads")?;
         let function = module
             .get_function("merge_heads_kernel")
             .context("Kernel load failed for merge_heads")?;
@@ -355,8 +353,10 @@ impl MultiHeadAttention {
         let grid_size = ((total as u32) + block_size - 1) / block_size;
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
-        let module = Module::from_ptx(include_str!("attention_scores_kernel.ptx"), &[])
-            .context("PTX load failed for attention_scores")?;
+        let module = kernel_cache::module(
+            include_str!("attention_scores_kernel.ptx"),
+            "attention_scores",
+        )?;
         let function = module
             .get_function("attention_scores_kernel")
             .context("Kernel load failed for attention_scores")?;
@@ -434,8 +434,10 @@ impl MultiHeadAttention {
         let grid_size = ((total as u32) + block_size - 1) / block_size;
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
-        let module = Module::from_ptx(include_str!("apply_attention_kernel.ptx"), &[])
-            .context("PTX load failed for apply_attention")?;
+        let module = kernel_cache::module(
+            include_str!("apply_attention_kernel.ptx"),
+            "apply_attention",
+        )?;
         let function = module
             .get_function("apply_attention_kernel")
             .context("Kernel load failed for apply_attention")?;
@@ -476,6 +478,31 @@ impl MultiHeadAttention {
         if let Some(bias) = &self.b_o {
             out.push((format!("{prefix}.b_o"), bias));
         }
+    }
+
+    pub fn visit_parameters_mut<F>(&mut self, prefix: &str, f: &mut F) -> Result<()>
+    where
+        F: FnMut(&str, &mut Tensor) -> Result<()>,
+    {
+        f(&format!("{prefix}.w_q"), &mut self.w_q)?;
+        f(&format!("{prefix}.w_k"), &mut self.w_k)?;
+        f(&format!("{prefix}.w_v"), &mut self.w_v)?;
+        f(&format!("{prefix}.w_o"), &mut self.w_o)?;
+
+        if let Some(bias) = &mut self.b_q {
+            f(&format!("{prefix}.b_q"), bias)?;
+        }
+        if let Some(bias) = &mut self.b_k {
+            f(&format!("{prefix}.b_k"), bias)?;
+        }
+        if let Some(bias) = &mut self.b_v {
+            f(&format!("{prefix}.b_v"), bias)?;
+        }
+        if let Some(bias) = &mut self.b_o {
+            f(&format!("{prefix}.b_o"), bias)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -693,6 +720,21 @@ impl FeedForwardNetwork {
             out.push((format!("{prefix}.b2"), bias));
         }
     }
+
+    pub fn visit_parameters_mut<F>(&mut self, prefix: &str, f: &mut F) -> Result<()>
+    where
+        F: FnMut(&str, &mut Tensor) -> Result<()>,
+    {
+        f(&format!("{prefix}.w1"), &mut self.w1)?;
+        f(&format!("{prefix}.w2"), &mut self.w2)?;
+        if let Some(bias) = &mut self.b1 {
+            f(&format!("{prefix}.b1"), bias)?;
+        }
+        if let Some(bias) = &mut self.b2 {
+            f(&format!("{prefix}.b2"), bias)?;
+        }
+        Ok(())
+    }
 }
 
 impl Layer for FeedForwardNetwork {
@@ -824,6 +866,15 @@ impl LayerNorm {
         out.push((format!("{prefix}.gamma"), &self.gamma));
         out.push((format!("{prefix}.beta"), &self.beta));
     }
+
+    pub fn visit_parameters_mut<F>(&mut self, prefix: &str, f: &mut F) -> Result<()>
+    where
+        F: FnMut(&str, &mut Tensor) -> Result<()>,
+    {
+        f(&format!("{prefix}.gamma"), &mut self.gamma)?;
+        f(&format!("{prefix}.beta"), &mut self.beta)?;
+        Ok(())
+    }
 }
 
 impl Layer for LayerNorm {
@@ -874,8 +925,7 @@ impl Layer for LayerNorm {
         let result = Tensor::new(input.shape().to_vec(), &input.device)?;
         let stream =
             Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
-        let module = Module::from_ptx(include_str!("layer_norm_kernel.ptx"), &[])
-            .context("PTX load failed for layer_norm")?;
+        let module = kernel_cache::module(include_str!("layer_norm_kernel.ptx"), "layer_norm")?;
         let function = module
             .get_function("layer_norm_kernel")
             .context("Kernel load failed for layer_norm")?;

@@ -1,9 +1,15 @@
+use crate::kernel_cache;
 use crate::model::GPTModel;
 use crate::tensor::Tensor;
 use crate::tokenizer::Tokenizer;
 use anyhow::{Context, Result, anyhow};
-use rand::seq::SliceRandom;
-use std::convert::TryFrom;
+use cust::prelude::*;
+use cust::{
+    device::Device,
+    memory::DeviceBuffer,
+    stream::{Stream, StreamFlags},
+};
+use rand::{Rng, seq::SliceRandom};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -20,6 +26,9 @@ pub struct TrainingConfig {
     pub momentum: f32,
     pub weight_decay: f32,
     pub log_every: usize,
+    pub use_spsa: bool,
+    pub spsa_learning_rate: f32,
+    pub spsa_epsilon: f32,
 }
 
 impl TrainingConfig {
@@ -51,6 +60,18 @@ impl TrainingConfig {
         if self.log_every == 0 {
             return Err(anyhow!("TrainingConfig log_every must be > 0"));
         }
+        if self.use_spsa {
+            if !(self.spsa_learning_rate.is_finite()) || self.spsa_learning_rate <= 0.0 {
+                return Err(anyhow!(
+                    "TrainingConfig spsa_learning_rate must be finite and positive"
+                ));
+            }
+            if !(self.spsa_epsilon.is_finite()) || self.spsa_epsilon <= 0.0 {
+                return Err(anyhow!(
+                    "TrainingConfig spsa_epsilon must be finite and positive"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -67,6 +88,9 @@ impl Default for TrainingConfig {
             momentum: 0.9,
             weight_decay: 1e-2,
             log_every: 100,
+            use_spsa: false,
+            spsa_learning_rate: 1e-3,
+            spsa_epsilon: 1e-3,
         }
     }
 }
@@ -87,32 +111,34 @@ struct LmHeadOptimizer {
     weight_decay: f32,
     embed_dim: usize,
     vocab_size: usize,
-    grad_logits: Vec<f32>,
-    grad_weight: Vec<f32>,
-    grad_bias: Vec<f32>,
-    velocity_weight: Vec<f32>,
-    velocity_bias: Vec<f32>,
+    velocity_weight: Tensor,
+    velocity_bias: Option<Tensor>,
 }
 
 impl LmHeadOptimizer {
-    fn new(embed_dim: usize, vocab_size: usize, has_bias: bool, config: &TrainingConfig) -> Self {
-        let weight_elems = embed_dim
-            .checked_mul(vocab_size)
-            .expect("lm_head shape overflow");
-        let bias_elems = if has_bias { vocab_size } else { 0 };
+    fn new(
+        device: &Device,
+        embed_dim: usize,
+        vocab_size: usize,
+        has_bias: bool,
+        config: &TrainingConfig,
+    ) -> Result<Self> {
+        let velocity_weight = Tensor::new(vec![embed_dim, vocab_size], device)?;
+        let velocity_bias = if has_bias {
+            Some(Tensor::new(vec![1, vocab_size], device)?)
+        } else {
+            None
+        };
 
-        Self {
+        Ok(Self {
             learning_rate: config.learning_rate,
             momentum: config.momentum,
             weight_decay: config.weight_decay,
             embed_dim,
             vocab_size,
-            grad_logits: Vec::new(),
-            grad_weight: vec![0.0; weight_elems],
-            grad_bias: vec![0.0; bias_elems],
-            velocity_weight: vec![0.0; weight_elems],
-            velocity_bias: vec![0.0; bias_elems],
-        }
+            velocity_weight,
+            velocity_bias,
+        })
     }
 
     fn step(
@@ -160,105 +186,176 @@ impl LmHeadOptimizer {
             ));
         }
 
-        let hidden_host = hidden.to_host()?;
-        let logits_host = logits.to_host()?;
-
-        let grad_logits_len = batch_seq
-            .checked_mul(vocab_size)
-            .ok_or_else(|| anyhow!("Gradient buffer overflow"))?;
-        self.grad_logits.resize(grad_logits_len, 0.0);
-        for value in &mut self.grad_logits {
-            *value = 0.0;
-        }
-        for value in &mut self.grad_weight {
-            *value = 0.0;
-        }
-        for value in &mut self.grad_bias {
-            *value = 0.0;
-        }
-
-        let mut loss_acc = 0f32;
         let inv_batch = 1.0f32 / (batch_seq as f32);
+        let probs = logits.softmax()?;
+        let (grad_logits, loss) = cross_entropy_backward_with_loss(&probs, targets, inv_batch)?;
 
-        for i in 0..batch_seq {
-            let offset = i * vocab_size;
-            let slice = &logits_host[offset..offset + vocab_size];
-            let target_idx = usize::try_from(targets[i])
-                .map_err(|_| anyhow!("Target token index {} does not fit in usize", targets[i]))?;
-            if target_idx >= vocab_size {
-                return Err(anyhow!(
-                    "Target token {} exceeds vocabulary size {}",
-                    target_idx,
-                    vocab_size
-                ));
-            }
-
-            let max_logit = slice
-                .iter()
-                .fold(f32::NEG_INFINITY, |acc, &val| acc.max(val));
-            let mut sum_exp = 0f32;
-            for &logit in slice {
-                sum_exp += (logit - max_logit).exp();
-            }
-            let log_sum = sum_exp.ln();
-            loss_acc += -(slice[target_idx] - max_logit) + log_sum;
-
-            for j in 0..vocab_size {
-                let prob = (slice[j] - max_logit).exp() / sum_exp;
-                let indicator = if j == target_idx { 1.0 } else { 0.0 };
-                self.grad_logits[offset + j] = (prob - indicator) * inv_batch;
-            }
-        }
-
-        loss_acc /= batch_seq as f32;
-
-        for i in 0..batch_seq {
-            let hidden_row = &hidden_host[i * embed_dim..(i + 1) * embed_dim];
-            let grad_row = &self.grad_logits[i * vocab_size..(i + 1) * vocab_size];
-
-            for j in 0..vocab_size {
-                let grad = grad_row[j];
-                if !self.grad_bias.is_empty() {
-                    self.grad_bias[j] += grad;
-                }
-                if grad == 0.0 {
-                    continue;
-                }
-
-                let mut weight_offset = j;
-                for &hidden_val in hidden_row {
-                    self.grad_weight[weight_offset] += hidden_val * grad;
-                    weight_offset += vocab_size;
-                }
-            }
-        }
+        let hidden_t = hidden.transpose2d()?;
+        let mut grad_weight = hidden_t.matmul(&grad_logits)?;
 
         let (weight_tensor, bias_tensor_opt) = model.lm_head_params_mut();
-        let mut weight_host = weight_tensor.to_host()?;
+        let weight_decay_term = weight_tensor.mul_scalar(self.weight_decay)?;
+        grad_weight = grad_weight.add(&weight_decay_term)?;
 
-        for (idx, w) in weight_host.iter_mut().enumerate() {
-            let grad = self.grad_weight[idx] + self.weight_decay * *w;
-            let velocity = self.momentum * self.velocity_weight[idx] + grad;
-            self.velocity_weight[idx] = velocity;
-            *w -= self.learning_rate * velocity;
-        }
-        weight_tensor.copy_from_host(&weight_host)?;
+        let momentum_velocity = self.velocity_weight.mul_scalar(self.momentum)?;
+        self.velocity_weight = momentum_velocity.add(&grad_weight)?;
+        let weight_update = self.velocity_weight.mul_scalar(self.learning_rate)?;
+        let new_weight = weight_tensor.sub(&weight_update)?;
+        *weight_tensor = new_weight;
 
         if let Some(bias_tensor) = bias_tensor_opt {
-            if !self.grad_bias.is_empty() {
-                let mut bias_host = bias_tensor.to_host()?;
-                for (idx, b) in bias_host.iter_mut().enumerate() {
-                    let grad = self.grad_bias[idx];
-                    let velocity = self.momentum * self.velocity_bias[idx] + grad;
-                    self.velocity_bias[idx] = velocity;
-                    *b -= self.learning_rate * velocity;
-                }
-                bias_tensor.copy_from_host(&bias_host)?;
+            if let Some(velocity_bias) = &mut self.velocity_bias {
+                let grad_logits_t = grad_logits.transpose2d()?;
+                let grad_bias = grad_logits_t.sum_rows()?.reshape(vec![1, vocab_size])?;
+
+                let momentum_bias = velocity_bias.mul_scalar(self.momentum)?;
+                *velocity_bias = momentum_bias.add(&grad_bias)?;
+                let bias_update = velocity_bias.mul_scalar(self.learning_rate)?;
+                let new_bias = bias_tensor.sub(&bias_update)?;
+                *bias_tensor = new_bias;
             }
         }
 
-        Ok(loss_acc)
+        Ok(loss)
     }
+}
+
+fn cross_entropy_backward_with_loss(
+    probs: &Tensor,
+    targets: &[u32],
+    inv_batch: f32,
+) -> Result<(Tensor, f32)> {
+    if probs.shape().len() != 2 {
+        return Err(anyhow!(
+            "cross_entropy_backward_with_loss expects a 2D tensor, got {:?}",
+            probs.shape()
+        ));
+    }
+
+    let batch_seq = probs.shape()[0];
+    let vocab_size = probs.shape()[1];
+
+    if targets.len() != batch_seq {
+        return Err(anyhow!(
+            "Target length {} does not match batch*seq {}",
+            targets.len(),
+            batch_seq
+        ));
+    }
+
+    let targets_device = DeviceBuffer::from_slice(targets)
+        .context("Failed to copy targets to device for cross-entropy")?;
+
+    let module = kernel_cache::module(include_str!("cross_entropy_kernel.ptx"), "cross_entropy")?;
+    let backward_function = module
+        .get_function("cross_entropy_backward_kernel")
+        .context("Kernel load failed for cross_entropy_backward_kernel")?;
+    let gather_function = module
+        .get_function("gather_target_prob_kernel")
+        .context("Kernel load failed for gather_target_prob_kernel")?;
+
+    let grad_logits = Tensor::new(vec![batch_seq, vocab_size], &probs.device)?;
+    let target_probs = Tensor::new(vec![batch_seq], &probs.device)?;
+
+    let block_size = 256u32;
+    let grad_total = (batch_seq
+        .checked_mul(vocab_size)
+        .ok_or_else(|| anyhow!("cross-entropy tensor size overflow"))?) as u32;
+    let grad_grid = (grad_total + block_size - 1) / block_size;
+    let gather_grid = ((batch_seq as u32) + block_size - 1) / block_size;
+
+    let stream =
+        Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+
+    unsafe {
+        launch!(backward_function<<<grad_grid, block_size, 0, stream>>>(
+            probs.data.as_device_ptr(),
+            targets_device.as_device_ptr(),
+            grad_logits.data.as_device_ptr(),
+            inv_batch,
+            vocab_size as i32,
+            batch_seq as i32
+        ))?;
+
+        launch!(gather_function<<<gather_grid, block_size, 0, stream>>>(
+            probs.data.as_device_ptr(),
+            targets_device.as_device_ptr(),
+            target_probs.data.as_device_ptr(),
+            vocab_size as i32,
+            batch_seq as i32
+        ))?;
+    }
+
+    stream
+        .synchronize()
+        .context("Stream sync failed for cross-entropy kernels")?;
+
+    let target_probs_host = target_probs.to_host()?;
+    let mut loss_acc = 0f32;
+    for prob in target_probs_host {
+        let clipped = prob.max(1e-12);
+        loss_acc += -clipped.ln();
+    }
+
+    let loss = loss_acc / batch_seq as f32;
+    Ok((grad_logits, loss))
+}
+
+fn cross_entropy_loss_from_probs(probs: &Tensor, targets: &[u32]) -> Result<f32> {
+    if probs.shape().len() != 2 {
+        return Err(anyhow!(
+            "cross_entropy_loss_from_probs expects a 2D tensor, got {:?}",
+            probs.shape()
+        ));
+    }
+
+    let batch_seq = probs.shape()[0];
+    let vocab_size = probs.shape()[1];
+
+    if targets.len() != batch_seq {
+        return Err(anyhow!(
+            "Target length {} does not match batch*seq {}",
+            targets.len(),
+            batch_seq
+        ));
+    }
+
+    let targets_device = DeviceBuffer::from_slice(targets)
+        .context("Failed to copy targets to device for cross-entropy loss")?;
+
+    let module = kernel_cache::module(include_str!("cross_entropy_kernel.ptx"), "cross_entropy")?;
+    let gather_function = module
+        .get_function("gather_target_prob_kernel")
+        .context("Kernel load failed for gather_target_prob_kernel")?;
+
+    let target_probs = Tensor::new(vec![batch_seq], &probs.device)?;
+    let block_size = 256u32;
+    let grid_size = ((batch_seq as u32) + block_size - 1) / block_size;
+    let stream =
+        Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+
+    unsafe {
+        launch!(gather_function<<<grid_size, block_size, 0, stream>>>(
+            probs.data.as_device_ptr(),
+            targets_device.as_device_ptr(),
+            target_probs.data.as_device_ptr(),
+            vocab_size as i32,
+            batch_seq as i32
+        ))?;
+    }
+
+    stream
+        .synchronize()
+        .context("Stream sync failed for gather_target_prob_kernel")?;
+
+    let target_probs_host = target_probs.to_host()?;
+    let mut loss_acc = 0f32;
+    for prob in target_probs_host {
+        let clipped = prob.max(1e-12);
+        loss_acc += -clipped.ln();
+    }
+
+    Ok(loss_acc / batch_seq as f32)
 }
 
 /// Load a UTF-8 text corpus from disk and tokenize it into a flat token stream.
@@ -339,7 +436,8 @@ pub fn train_lm_head_from_text(
         let has_bias = bias_tensor_opt.is_some();
         (embed_dim, vocab_size, has_bias)
     };
-    let mut optimizer = LmHeadOptimizer::new(embed_dim, vocab_size, has_bias, config);
+    let mut optimizer =
+        LmHeadOptimizer::new(model.device(), embed_dim, vocab_size, has_bias, config)?;
 
     for _epoch in 0..config.epochs {
         let mut positions: Vec<usize> = (0..=window_limit).collect();
@@ -373,7 +471,18 @@ pub fn train_lm_head_from_text(
 
             let (hidden, logits) =
                 model.forward_with_hidden(&inputs, config.batch_size, config.seq_len)?;
-            let batch_loss = optimizer.step(model, hidden, logits, &targets)?;
+            let mut batch_loss = optimizer.step(model, hidden, logits, &targets)?;
+
+            if config.use_spsa {
+                batch_loss = spsa_step(
+                    model,
+                    &inputs,
+                    &targets,
+                    config.batch_size,
+                    config.seq_len,
+                    config,
+                )?;
+            }
 
             epoch_loss_acc += batch_loss;
             epoch_batches += 1;
@@ -404,4 +513,125 @@ pub fn train_lm_head_from_text(
         total_batches,
         total_tokens,
     })
+}
+
+struct ParameterSnapshot {
+    name: String,
+    tensor_ptr: *mut Tensor,
+    original: Vec<f32>,
+    delta: Vec<f32>,
+}
+
+impl ParameterSnapshot {
+    fn new(name: String, tensor: &mut Tensor) -> Result<Self> {
+        let original = tensor
+            .to_host()
+            .with_context(|| format!("Failed to copy parameter {name} to host for SPSA"))?;
+        Ok(Self {
+            name,
+            tensor_ptr: tensor as *mut Tensor,
+            original,
+            delta: Vec::new(),
+        })
+    }
+
+    fn with_scaled(&self, scale: f32) -> Vec<f32> {
+        self.original
+            .iter()
+            .zip(&self.delta)
+            .map(|(&weight, &direction)| weight + scale * direction)
+            .collect()
+    }
+
+    fn updated_values(&self, coeff: f32, lr: f32, weight_decay: f32) -> Vec<f32> {
+        self.original
+            .iter()
+            .zip(&self.delta)
+            .map(|(&weight, &direction)| {
+                let grad_estimate = coeff * direction + weight_decay * weight;
+                weight - lr * grad_estimate
+            })
+            .collect()
+    }
+
+    fn apply(&self, data: &[f32]) -> Result<()> {
+        unsafe {
+            (*self.tensor_ptr)
+                .copy_from_host(data)
+                .with_context(|| format!("Failed to upload parameter {} during SPSA", self.name))
+        }
+    }
+}
+
+fn spsa_step(
+    model: &mut GPTModel,
+    inputs: &[u32],
+    targets: &[u32],
+    batch_size: usize,
+    seq_len: usize,
+    config: &TrainingConfig,
+) -> Result<f32> {
+    let mut snapshots: Vec<ParameterSnapshot> = Vec::new();
+    model.visit_parameters_mut(|name, tensor| {
+        if name.starts_with("lm_head") {
+            return Ok(());
+        }
+        let snapshot = ParameterSnapshot::new(name.to_string(), tensor)?;
+        snapshots.push(snapshot);
+        Ok(())
+    })?;
+
+    if snapshots.is_empty() {
+        return compute_batch_loss(model, inputs, targets, batch_size, seq_len);
+    }
+
+    let mut rng = rand::rng();
+
+    for snapshot in &mut snapshots {
+        snapshot.delta = snapshot
+            .original
+            .iter()
+            .map(|_| if rng.random::<bool>() { 1.0 } else { -1.0 })
+            .collect();
+    }
+
+    for snapshot in &snapshots {
+        let plus = snapshot.with_scaled(config.spsa_epsilon);
+        snapshot.apply(&plus)?;
+    }
+    let loss_plus = compute_batch_loss(model, inputs, targets, batch_size, seq_len)?;
+
+    for snapshot in &snapshots {
+        let minus = snapshot.with_scaled(-config.spsa_epsilon);
+        snapshot.apply(&minus)?;
+    }
+    let loss_minus = compute_batch_loss(model, inputs, targets, batch_size, seq_len)?;
+
+    for snapshot in &snapshots {
+        snapshot.apply(&snapshot.original)?;
+    }
+
+    let coeff = (loss_plus - loss_minus) / (2.0 * config.spsa_epsilon);
+
+    for snapshot in &snapshots {
+        let updated =
+            snapshot.updated_values(coeff, config.spsa_learning_rate, config.weight_decay);
+        snapshot.apply(&updated)?;
+    }
+
+    compute_batch_loss(model, inputs, targets, batch_size, seq_len)
+}
+
+fn compute_batch_loss(
+    model: &GPTModel,
+    inputs: &[u32],
+    targets: &[u32],
+    batch_size: usize,
+    seq_len: usize,
+) -> Result<f32> {
+    let vocab_size = model.config().vocab_size;
+    let logits = model.forward(inputs, batch_size, seq_len)?;
+    let logits = logits.reshape(vec![batch_size * seq_len, vocab_size])?;
+    let probs = logits.softmax()?;
+    cross_entropy_loss_from_probs(&probs, targets)
 }
