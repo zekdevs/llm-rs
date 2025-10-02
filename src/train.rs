@@ -1,5 +1,6 @@
 use crate::kernel_cache;
-use crate::model::GPTModel;
+use crate::layers::{FeedForwardGradients, LayerNormGradients, MultiHeadAttentionGradients};
+use crate::model::{GPTGradients, GPTModel, TransformerBlockGradients};
 use crate::tensor::Tensor;
 use crate::tokenizer::Tokenizer;
 use anyhow::{Context, Result, anyhow};
@@ -9,7 +10,8 @@ use cust::{
     memory::DeviceBuffer,
     stream::{Stream, StreamFlags},
 };
-use rand::{Rng, seq::SliceRandom};
+use rand::seq::SliceRandom;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -26,9 +28,7 @@ pub struct TrainingConfig {
     pub momentum: f32,
     pub weight_decay: f32,
     pub log_every: usize,
-    pub use_spsa: bool,
-    pub spsa_learning_rate: f32,
-    pub spsa_epsilon: f32,
+    pub gradient_clip_norm: Option<f32>,
 }
 
 impl TrainingConfig {
@@ -60,15 +60,10 @@ impl TrainingConfig {
         if self.log_every == 0 {
             return Err(anyhow!("TrainingConfig log_every must be > 0"));
         }
-        if self.use_spsa {
-            if !(self.spsa_learning_rate.is_finite()) || self.spsa_learning_rate <= 0.0 {
+        if let Some(clip) = self.gradient_clip_norm {
+            if !clip.is_finite() || clip <= 0.0 {
                 return Err(anyhow!(
-                    "TrainingConfig spsa_learning_rate must be finite and positive"
-                ));
-            }
-            if !(self.spsa_epsilon.is_finite()) || self.spsa_epsilon <= 0.0 {
-                return Err(anyhow!(
-                    "TrainingConfig spsa_epsilon must be finite and positive"
+                    "TrainingConfig gradient_clip_norm must be finite and positive when set"
                 ));
             }
         }
@@ -88,9 +83,7 @@ impl Default for TrainingConfig {
             momentum: 0.9,
             weight_decay: 1e-2,
             log_every: 100,
-            use_spsa: false,
-            spsa_learning_rate: 1e-3,
-            spsa_epsilon: 1e-3,
+            gradient_clip_norm: Some(1.0),
         }
     }
 }
@@ -113,6 +106,7 @@ struct LmHeadOptimizer {
     vocab_size: usize,
     velocity_weight: Tensor,
     velocity_bias: Option<Tensor>,
+    gradient_clip_norm: Option<f32>,
 }
 
 impl LmHeadOptimizer {
@@ -138,6 +132,7 @@ impl LmHeadOptimizer {
             vocab_size,
             velocity_weight,
             velocity_bias,
+            gradient_clip_norm: config.gradient_clip_norm,
         })
     }
 
@@ -147,7 +142,7 @@ impl LmHeadOptimizer {
         hidden: Tensor,
         logits: Tensor,
         targets: &[u32],
-    ) -> Result<f32> {
+    ) -> Result<(Tensor, f32)> {
         if hidden.shape().len() != 2 || logits.shape().len() != 2 {
             return Err(anyhow!("Expected 2D tensors for hidden states and logits"));
         }
@@ -190,10 +185,35 @@ impl LmHeadOptimizer {
         let probs = logits.softmax()?;
         let (grad_logits, loss) = cross_entropy_backward_with_loss(&probs, targets, inv_batch)?;
 
-        let hidden_t = hidden.transpose2d()?;
-        let mut grad_weight = hidden_t.matmul(&grad_logits)?;
-
         let (weight_tensor, bias_tensor_opt) = model.lm_head_params_mut();
+        let weight_snapshot = weight_tensor.clone();
+
+        let (mut grad_hidden, mut grad_weight) =
+            Tensor::matmul_backward(&hidden, &weight_snapshot, &grad_logits)?;
+
+        let mut grad_bias = if bias_tensor_opt.is_some() {
+            let grad_logits_t = grad_logits.transpose2d()?;
+            Some(grad_logits_t.sum_rows()?.reshape(vec![1, vocab_size])?)
+        } else {
+            None
+        };
+
+        if let Some(clip_norm) = self.gradient_clip_norm {
+            let mut total_sq = grad_weight.l2_norm_squared()?;
+            if let Some(ref gb) = grad_bias {
+                total_sq += gb.l2_norm_squared()?;
+            }
+            let total_norm = total_sq.sqrt();
+            if total_norm > clip_norm {
+                let scale = clip_norm / (total_norm + 1e-6);
+                grad_weight = grad_weight.mul_scalar(scale)?;
+                if let Some(ref mut gb) = grad_bias {
+                    *gb = gb.mul_scalar(scale)?;
+                }
+                grad_hidden = grad_hidden.mul_scalar(scale)?;
+            }
+        }
+
         let weight_decay_term = weight_tensor.mul_scalar(self.weight_decay)?;
         grad_weight = grad_weight.add(&weight_decay_term)?;
 
@@ -205,18 +225,207 @@ impl LmHeadOptimizer {
 
         if let Some(bias_tensor) = bias_tensor_opt {
             if let Some(velocity_bias) = &mut self.velocity_bias {
-                let grad_logits_t = grad_logits.transpose2d()?;
-                let grad_bias = grad_logits_t.sum_rows()?.reshape(vec![1, vocab_size])?;
-
-                let momentum_bias = velocity_bias.mul_scalar(self.momentum)?;
-                *velocity_bias = momentum_bias.add(&grad_bias)?;
-                let bias_update = velocity_bias.mul_scalar(self.learning_rate)?;
-                let new_bias = bias_tensor.sub(&bias_update)?;
-                *bias_tensor = new_bias;
+                if let Some(grad_bias_tensor) = grad_bias {
+                    let momentum_bias = velocity_bias.mul_scalar(self.momentum)?;
+                    *velocity_bias = momentum_bias.add(&grad_bias_tensor)?;
+                    let bias_update = velocity_bias.mul_scalar(self.learning_rate)?;
+                    let new_bias = bias_tensor.sub(&bias_update)?;
+                    *bias_tensor = new_bias;
+                }
             }
         }
 
-        Ok(loss)
+        Ok((grad_hidden, loss))
+    }
+}
+
+struct EncoderOptimizer {
+    learning_rate: f32,
+    momentum: f32,
+    weight_decay: f32,
+    velocities: HashMap<String, Tensor>,
+    gradient_clip_norm: Option<f32>,
+}
+
+impl EncoderOptimizer {
+    fn new(model: &mut GPTModel, config: &TrainingConfig) -> Result<Self> {
+        let mut velocities = HashMap::new();
+        model.visit_parameters_mut(|name, param| {
+            if name.starts_with("lm_head.") {
+                return Ok(());
+            }
+            let velocity = Tensor::new(param.shape().to_vec(), &param.device)?;
+            velocities.insert(name.to_string(), velocity);
+            Ok(())
+        })?;
+
+        Ok(Self {
+            learning_rate: config.learning_rate,
+            momentum: config.momentum,
+            weight_decay: config.weight_decay,
+            velocities,
+            gradient_clip_norm: config.gradient_clip_norm,
+        })
+    }
+
+    fn step(&mut self, model: &mut GPTModel, grads: GPTGradients) -> Result<()> {
+        let mut grad_map = Self::collect_gradients(grads);
+
+        if let Some(clip_norm) = self.gradient_clip_norm {
+            let mut total_sq = 0f32;
+            for grad in grad_map.values() {
+                total_sq += grad.l2_norm_squared()?;
+            }
+            let total_norm = total_sq.sqrt();
+            if total_norm > clip_norm {
+                let scale = clip_norm / (total_norm + 1e-6);
+                for grad in grad_map.values_mut() {
+                    *grad = grad.mul_scalar(scale)?;
+                }
+            }
+        }
+
+        model.visit_parameters_mut(|name, param| {
+            if name.starts_with("lm_head.") {
+                return Ok(());
+            }
+
+            let grad = grad_map
+                .remove(name)
+                .ok_or_else(|| anyhow!("Missing gradient for parameter {name}"))?;
+            self.apply_update(name, param, grad)?;
+            Ok(())
+        })?;
+
+        if !grad_map.is_empty() {
+            let leftover: Vec<String> = grad_map.keys().cloned().collect();
+            return Err(anyhow!(
+                "Unused gradients provided for parameters: {:?}",
+                leftover
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn apply_update(&mut self, name: &str, param: &mut Tensor, grad: Tensor) -> Result<()> {
+        let velocity = self
+            .velocities
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("Missing velocity for parameter {name}"))?;
+
+        let mut grad_accum = grad;
+        if Self::should_apply_weight_decay(name) && self.weight_decay > 0.0 {
+            let decay = param.mul_scalar(self.weight_decay)?;
+            grad_accum = grad_accum.add(&decay)?;
+        }
+
+        let momentum_term = velocity.mul_scalar(self.momentum)?;
+        *velocity = momentum_term.add(&grad_accum)?;
+        let update = velocity.mul_scalar(self.learning_rate)?;
+        let new_param = param.sub(&update)?;
+        *param = new_param;
+        Ok(())
+    }
+
+    fn collect_gradients(grads: GPTGradients) -> HashMap<String, Tensor> {
+        let GPTGradients {
+            token_embedding,
+            position_embedding,
+            blocks,
+            final_norm,
+        } = grads;
+
+        let LayerNormGradients {
+            gamma: final_gamma,
+            beta: final_beta,
+        } = final_norm;
+
+        let mut map = HashMap::new();
+        map.insert("token_embedding.weight".to_string(), token_embedding);
+        map.insert("position_embedding.weight".to_string(), position_embedding);
+        map.insert("final_norm.gamma".to_string(), final_gamma);
+        map.insert("final_norm.beta".to_string(), final_beta);
+
+        for (index, block_grad) in blocks.into_iter().enumerate() {
+            let TransformerBlockGradients {
+                attention,
+                norm1,
+                norm2,
+                feed_forward,
+            } = block_grad;
+
+            let MultiHeadAttentionGradients {
+                w_q,
+                w_k,
+                w_v,
+                w_o,
+                b_q,
+                b_k,
+                b_v,
+                b_o,
+            } = attention;
+
+            let LayerNormGradients {
+                gamma: norm1_gamma,
+                beta: norm1_beta,
+            } = norm1;
+            let LayerNormGradients {
+                gamma: norm2_gamma,
+                beta: norm2_beta,
+            } = norm2;
+
+            let FeedForwardGradients { w1, b1, w2, b2 } = feed_forward;
+
+            let prefix = format!("blocks.{index}");
+            let attention_prefix = format!("{prefix}.attention");
+            map.insert(format!("{attention_prefix}.w_q"), w_q);
+            map.insert(format!("{attention_prefix}.w_k"), w_k);
+            map.insert(format!("{attention_prefix}.w_v"), w_v);
+            map.insert(format!("{attention_prefix}.w_o"), w_o);
+            if let Some(b_q) = b_q {
+                map.insert(format!("{attention_prefix}.b_q"), b_q);
+            }
+            if let Some(b_k) = b_k {
+                map.insert(format!("{attention_prefix}.b_k"), b_k);
+            }
+            if let Some(b_v) = b_v {
+                map.insert(format!("{attention_prefix}.b_v"), b_v);
+            }
+            if let Some(b_o) = b_o {
+                map.insert(format!("{attention_prefix}.b_o"), b_o);
+            }
+
+            let norm1_prefix = format!("{prefix}.norm_1");
+            map.insert(format!("{norm1_prefix}.gamma"), norm1_gamma);
+            map.insert(format!("{norm1_prefix}.beta"), norm1_beta);
+
+            let norm2_prefix = format!("{prefix}.norm_2");
+            map.insert(format!("{norm2_prefix}.gamma"), norm2_gamma);
+            map.insert(format!("{norm2_prefix}.beta"), norm2_beta);
+
+            let mlp_prefix = format!("{prefix}.mlp");
+            map.insert(format!("{mlp_prefix}.w1"), w1);
+            map.insert(format!("{mlp_prefix}.w2"), w2);
+            if let Some(b1) = b1 {
+                map.insert(format!("{mlp_prefix}.b1"), b1);
+            }
+            if let Some(b2) = b2 {
+                map.insert(format!("{mlp_prefix}.b2"), b2);
+            }
+        }
+
+        map
+    }
+
+    fn should_apply_weight_decay(name: &str) -> bool {
+        name.ends_with(".weight")
+            || name.ends_with(".w_q")
+            || name.ends_with(".w_k")
+            || name.ends_with(".w_v")
+            || name.ends_with(".w_o")
+            || name.ends_with(".w1")
+            || name.ends_with(".w2")
     }
 }
 
@@ -301,63 +510,6 @@ fn cross_entropy_backward_with_loss(
     Ok((grad_logits, loss))
 }
 
-fn cross_entropy_loss_from_probs(probs: &Tensor, targets: &[u32]) -> Result<f32> {
-    if probs.shape().len() != 2 {
-        return Err(anyhow!(
-            "cross_entropy_loss_from_probs expects a 2D tensor, got {:?}",
-            probs.shape()
-        ));
-    }
-
-    let batch_seq = probs.shape()[0];
-    let vocab_size = probs.shape()[1];
-
-    if targets.len() != batch_seq {
-        return Err(anyhow!(
-            "Target length {} does not match batch*seq {}",
-            targets.len(),
-            batch_seq
-        ));
-    }
-
-    let targets_device = DeviceBuffer::from_slice(targets)
-        .context("Failed to copy targets to device for cross-entropy loss")?;
-
-    let module = kernel_cache::module(include_str!("cross_entropy_kernel.ptx"), "cross_entropy")?;
-    let gather_function = module
-        .get_function("gather_target_prob_kernel")
-        .context("Kernel load failed for gather_target_prob_kernel")?;
-
-    let target_probs = Tensor::new(vec![batch_seq], &probs.device)?;
-    let block_size = 256u32;
-    let grid_size = ((batch_seq as u32) + block_size - 1) / block_size;
-    let stream =
-        Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
-
-    unsafe {
-        launch!(gather_function<<<grid_size, block_size, 0, stream>>>(
-            probs.data.as_device_ptr(),
-            targets_device.as_device_ptr(),
-            target_probs.data.as_device_ptr(),
-            vocab_size as i32,
-            batch_seq as i32
-        ))?;
-    }
-
-    stream
-        .synchronize()
-        .context("Stream sync failed for gather_target_prob_kernel")?;
-
-    let target_probs_host = target_probs.to_host()?;
-    let mut loss_acc = 0f32;
-    for prob in target_probs_host {
-        let clipped = prob.max(1e-12);
-        loss_acc += -clipped.ln();
-    }
-
-    Ok(loss_acc / batch_seq as f32)
-}
-
 /// Load a UTF-8 text corpus from disk and tokenize it into a flat token stream.
 ///
 /// The dataset is expected to be preprocessed into newline-delimited UTF-8 text.
@@ -387,11 +539,11 @@ pub fn load_text_corpus(path: &Path, tokenizer: &Tokenizer) -> Result<Vec<u32>> 
     Ok(tokens)
 }
 
-/// Train only the language-model head of the GPT model using a basic SGD loop.
+/// Train the GPT model using a basic SGD loop with analytic gradients.
 ///
-/// The remainder of the transformer stack remains frozen—this keeps the example
-/// lightweight while still demonstrating end-to-end data movement, loss
-/// computation, and parameter updates on the GPU-backed tensors.
+/// This routine performs end-to-end backpropagation through the embeddings,
+/// transformer blocks, and layer norm in addition to the language-model head,
+/// applying momentum SGD with optional weight decay to every parameter.
 pub fn train_lm_head_from_text(
     model: &mut GPTModel,
     tokenizer: &Tokenizer,
@@ -436,8 +588,9 @@ pub fn train_lm_head_from_text(
         let has_bias = bias_tensor_opt.is_some();
         (embed_dim, vocab_size, has_bias)
     };
-    let mut optimizer =
+    let mut lm_head_optimizer =
         LmHeadOptimizer::new(model.device(), embed_dim, vocab_size, has_bias, config)?;
+    let mut encoder_optimizer = EncoderOptimizer::new(model, config)?;
 
     for _epoch in 0..config.epochs {
         let mut positions: Vec<usize> = (0..=window_limit).collect();
@@ -469,20 +622,13 @@ pub fn train_lm_head_from_text(
                 targets.extend_from_slice(target_slice);
             }
 
-            let (hidden, logits) =
-                model.forward_with_hidden(&inputs, config.batch_size, config.seq_len)?;
-            let mut batch_loss = optimizer.step(model, hidden, logits, &targets)?;
+            let (hidden, logits, cache) =
+                model.forward_with_cache(&inputs, config.batch_size, config.seq_len)?;
+            let (grad_hidden, batch_loss) =
+                lm_head_optimizer.step(model, hidden, logits, &targets)?;
 
-            if config.use_spsa {
-                batch_loss = spsa_step(
-                    model,
-                    &inputs,
-                    &targets,
-                    config.batch_size,
-                    config.seq_len,
-                    config,
-                )?;
-            }
+            let encoder_grads = model.backward(&cache, &grad_hidden)?;
+            encoder_optimizer.step(model, encoder_grads)?;
 
             epoch_loss_acc += batch_loss;
             epoch_batches += 1;
@@ -513,125 +659,4 @@ pub fn train_lm_head_from_text(
         total_batches,
         total_tokens,
     })
-}
-
-struct ParameterSnapshot {
-    name: String,
-    tensor_ptr: *mut Tensor,
-    original: Vec<f32>,
-    delta: Vec<f32>,
-}
-
-impl ParameterSnapshot {
-    fn new(name: String, tensor: &mut Tensor) -> Result<Self> {
-        let original = tensor
-            .to_host()
-            .with_context(|| format!("Failed to copy parameter {name} to host for SPSA"))?;
-        Ok(Self {
-            name,
-            tensor_ptr: tensor as *mut Tensor,
-            original,
-            delta: Vec::new(),
-        })
-    }
-
-    fn with_scaled(&self, scale: f32) -> Vec<f32> {
-        self.original
-            .iter()
-            .zip(&self.delta)
-            .map(|(&weight, &direction)| weight + scale * direction)
-            .collect()
-    }
-
-    fn updated_values(&self, coeff: f32, lr: f32, weight_decay: f32) -> Vec<f32> {
-        self.original
-            .iter()
-            .zip(&self.delta)
-            .map(|(&weight, &direction)| {
-                let grad_estimate = coeff * direction + weight_decay * weight;
-                weight - lr * grad_estimate
-            })
-            .collect()
-    }
-
-    fn apply(&self, data: &[f32]) -> Result<()> {
-        unsafe {
-            (*self.tensor_ptr)
-                .copy_from_host(data)
-                .with_context(|| format!("Failed to upload parameter {} during SPSA", self.name))
-        }
-    }
-}
-
-fn spsa_step(
-    model: &mut GPTModel,
-    inputs: &[u32],
-    targets: &[u32],
-    batch_size: usize,
-    seq_len: usize,
-    config: &TrainingConfig,
-) -> Result<f32> {
-    let mut snapshots: Vec<ParameterSnapshot> = Vec::new();
-    model.visit_parameters_mut(|name, tensor| {
-        if name.starts_with("lm_head") {
-            return Ok(());
-        }
-        let snapshot = ParameterSnapshot::new(name.to_string(), tensor)?;
-        snapshots.push(snapshot);
-        Ok(())
-    })?;
-
-    if snapshots.is_empty() {
-        return compute_batch_loss(model, inputs, targets, batch_size, seq_len);
-    }
-
-    let mut rng = rand::rng();
-
-    for snapshot in &mut snapshots {
-        snapshot.delta = snapshot
-            .original
-            .iter()
-            .map(|_| if rng.random::<bool>() { 1.0 } else { -1.0 })
-            .collect();
-    }
-
-    for snapshot in &snapshots {
-        let plus = snapshot.with_scaled(config.spsa_epsilon);
-        snapshot.apply(&plus)?;
-    }
-    let loss_plus = compute_batch_loss(model, inputs, targets, batch_size, seq_len)?;
-
-    for snapshot in &snapshots {
-        let minus = snapshot.with_scaled(-config.spsa_epsilon);
-        snapshot.apply(&minus)?;
-    }
-    let loss_minus = compute_batch_loss(model, inputs, targets, batch_size, seq_len)?;
-
-    for snapshot in &snapshots {
-        snapshot.apply(&snapshot.original)?;
-    }
-
-    let coeff = (loss_plus - loss_minus) / (2.0 * config.spsa_epsilon);
-
-    for snapshot in &snapshots {
-        let updated =
-            snapshot.updated_values(coeff, config.spsa_learning_rate, config.weight_decay);
-        snapshot.apply(&updated)?;
-    }
-
-    compute_batch_loss(model, inputs, targets, batch_size, seq_len)
-}
-
-fn compute_batch_loss(
-    model: &GPTModel,
-    inputs: &[u32],
-    targets: &[u32],
-    batch_size: usize,
-    seq_len: usize,
-) -> Result<f32> {
-    let vocab_size = model.config().vocab_size;
-    let logits = model.forward(inputs, batch_size, seq_len)?;
-    let logits = logits.reshape(vec![batch_size * seq_len, vocab_size])?;
-    let probs = logits.softmax()?;
-    cross_entropy_loss_from_probs(&probs, targets)
 }

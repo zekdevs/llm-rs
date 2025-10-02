@@ -11,13 +11,25 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::layers::{ActivationKind, FeedForwardNetwork, Layer, LayerNorm, MultiHeadAttention};
+use crate::layers::{
+    ActivationKind, FeedForwardCache, FeedForwardGradients, FeedForwardNetwork, Layer, LayerNorm,
+    LayerNormCache, LayerNormGradients, MultiHeadAttention, MultiHeadAttentionCache,
+    MultiHeadAttentionGradients,
+};
 use crate::tensor::Tensor;
 
+#[derive(Clone)]
 pub struct Embedding {
     weight: Tensor,
     vocab_size: usize,
     embed_dim: usize,
+}
+
+#[derive(Clone)]
+pub struct EmbeddingCache {
+    indices: Vec<i32>,
+    batch_size: usize,
+    seq_len: usize,
 }
 
 impl Embedding {
@@ -72,6 +84,10 @@ impl Embedding {
         &self.weight
     }
 
+    pub fn weight_mut(&mut self) -> &mut Tensor {
+        &mut self.weight
+    }
+
     pub fn visit_parameters_mut<F>(&mut self, prefix: &str, f: &mut F) -> Result<()>
     where
         F: FnMut(&str, &mut Tensor) -> Result<()>,
@@ -81,6 +97,16 @@ impl Embedding {
     }
 
     pub fn forward(&self, indices: &[u32], batch_size: usize, seq_len: usize) -> Result<Tensor> {
+        let (output, _) = self.forward_with_cache(indices, batch_size, seq_len)?;
+        Ok(output)
+    }
+
+    pub fn forward_with_cache(
+        &self,
+        indices: &[u32],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<(Tensor, EmbeddingCache)> {
         if batch_size == 0 {
             return Err(anyhow!("Embedding forward expects batch_size > 0"));
         }
@@ -114,7 +140,13 @@ impl Embedding {
             device_indices.push(index_i32);
         }
 
-        self.forward_i32(&device_indices, batch_size, seq_len)
+        let output = self.forward_i32(&device_indices, batch_size, seq_len)?;
+        let cache = EmbeddingCache {
+            indices: device_indices,
+            batch_size,
+            seq_len,
+        };
+        Ok((output, cache))
     }
 
     fn forward_i32(&self, indices: &[i32], batch_size: usize, seq_len: usize) -> Result<Tensor> {
@@ -167,6 +199,72 @@ impl Embedding {
 
         Ok(result)
     }
+
+    pub fn backward(&self, cache: &EmbeddingCache, grad_output: &Tensor) -> Result<Tensor> {
+        if grad_output.shape().len() != 3
+            || grad_output.shape()[0] != cache.batch_size
+            || grad_output.shape()[1] != cache.seq_len
+            || grad_output.shape()[2] != self.embed_dim
+        {
+            return Err(anyhow!(
+                "Embedding backward expects grad_output shape [{}, {}, {}], got {:?}",
+                cache.batch_size,
+                cache.seq_len,
+                self.embed_dim,
+                grad_output.shape()
+            ));
+        }
+
+        if grad_output.device.as_raw() != self.weight.device.as_raw() {
+            return Err(anyhow!(
+                "Embedding grad_output must reside on the same device as the weights"
+            ));
+        }
+
+        let total = cache
+            .batch_size
+            .checked_mul(cache.seq_len)
+            .and_then(|v| v.checked_mul(self.embed_dim))
+            .ok_or_else(|| anyhow!("Embedding backward launch configuration overflow"))?;
+        if total > i32::MAX as usize {
+            return Err(anyhow!(
+                "Embedding backward tensor too large for kernel launch"
+            ));
+        }
+
+        let grad_weight = Tensor::new(vec![self.vocab_size, self.embed_dim], &self.weight.device)?;
+        let indices_buffer = DeviceBuffer::from_slice(&cache.indices)?;
+
+        let block_size = 256u32;
+        let grid_size = ((total as u32) + block_size - 1) / block_size;
+
+        let module = kernel_cache::module(
+            include_str!("embedding_backward_kernel.ptx"),
+            "embedding_backward",
+        )?;
+        let function = module
+            .get_function("embedding_backward_kernel")
+            .context("Kernel load failed for embedding_backward_kernel")?;
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+
+        unsafe {
+            launch!(function<<<grid_size, block_size, 0, stream>>>(
+                grad_output.data.as_device_ptr(),
+                indices_buffer.as_device_ptr(),
+                grad_weight.data.as_device_ptr(),
+                cache.batch_size as i32,
+                cache.seq_len as i32,
+                self.embed_dim as i32
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .context("Stream sync failed for embedding_backward_kernel")?;
+
+        Ok(grad_weight)
+    }
 }
 
 pub struct TransformerBlock {
@@ -174,6 +272,21 @@ pub struct TransformerBlock {
     norm_1: LayerNorm,
     norm_2: LayerNorm,
     feed_forward: FeedForwardNetwork,
+}
+
+pub struct TransformerBlockCache {
+    input_shape: Vec<usize>,
+    norm1: LayerNormCache,
+    attention: MultiHeadAttentionCache,
+    norm2: LayerNormCache,
+    feed_forward: FeedForwardCache,
+}
+
+pub struct TransformerBlockGradients {
+    pub attention: MultiHeadAttentionGradients,
+    pub norm1: LayerNormGradients,
+    pub norm2: LayerNormGradients,
+    pub feed_forward: FeedForwardGradients,
 }
 
 impl TransformerBlock {
@@ -201,6 +314,72 @@ impl TransformerBlock {
             norm_2,
             feed_forward,
         })
+    }
+
+    pub fn forward_with_cache(&self, input: &Tensor) -> Result<(Tensor, TransformerBlockCache)> {
+        let (normalized, norm1_cache) = self.norm_1.forward_with_cache(input)?;
+        let (attention_output, attention_cache) = self.attention.forward_with_cache(&normalized)?;
+        let residual_1 = input.add(&attention_output)?;
+
+        let (normalized_2, norm2_cache) = self.norm_2.forward_with_cache(&residual_1)?;
+        let (feed_forward_output, feed_forward_cache) =
+            self.feed_forward.forward_with_cache(&normalized_2)?;
+
+        let output = residual_1.add(&feed_forward_output)?;
+
+        let cache = TransformerBlockCache {
+            input_shape: input.shape().to_vec(),
+            norm1: norm1_cache,
+            attention: attention_cache,
+            norm2: norm2_cache,
+            feed_forward: feed_forward_cache,
+        };
+
+        Ok((output, cache))
+    }
+
+    pub fn backward(
+        &self,
+        cache: &TransformerBlockCache,
+        grad_output: &Tensor,
+    ) -> Result<(Tensor, TransformerBlockGradients)> {
+        if grad_output.shape() != cache.input_shape.as_slice() {
+            return Err(anyhow!(
+                "TransformerBlock backward expects grad_output with shape {:?}, got {:?}",
+                cache.input_shape,
+                grad_output.shape()
+            ));
+        }
+
+        let (grad_norm2_input, feed_forward_grads) = self
+            .feed_forward
+            .backward(&cache.feed_forward, grad_output)?;
+
+        let (grad_residual_from_norm2, norm2_grads) =
+            self.norm_2.backward(&cache.norm2, &grad_norm2_input)?;
+
+        let grad_residual_total = grad_residual_from_norm2.add(grad_output)?;
+
+        let grad_input_from_residual = grad_residual_total.clone();
+        let grad_attention_output = grad_residual_total;
+
+        let (grad_norm1_output, attention_grads) = self
+            .attention
+            .backward(&cache.attention, &grad_attention_output)?;
+
+        let (grad_input_from_norm1, norm1_grads) =
+            self.norm_1.backward(&cache.norm1, &grad_norm1_output)?;
+
+        let grad_input = grad_input_from_residual.add(&grad_input_from_norm1)?;
+
+        let gradients = TransformerBlockGradients {
+            attention: attention_grads,
+            norm1: norm1_grads,
+            norm2: norm2_grads,
+            feed_forward: feed_forward_grads,
+        };
+
+        Ok((grad_input, gradients))
     }
 
     fn append_named_tensors<'a>(&'a self, index: usize, out: &mut Vec<(String, &'a Tensor)>) {
@@ -234,15 +413,25 @@ impl TransformerBlock {
 
 impl Layer for TransformerBlock {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let normalized = self.norm_1.forward(input)?;
-        let attention_output = self.attention.forward(&normalized)?;
-        let residual_1 = input.add(&attention_output)?;
-
-        let normalized_2 = self.norm_2.forward(&residual_1)?;
-        let feed_forward_output = self.feed_forward.forward(&normalized_2)?;
-
-        residual_1.add(&feed_forward_output)
+        let (output, _) = self.forward_with_cache(input)?;
+        Ok(output)
     }
+}
+
+pub struct GPTForwardCache {
+    batch_size: usize,
+    seq_len: usize,
+    token_embedding: EmbeddingCache,
+    position_embedding: EmbeddingCache,
+    block_caches: Vec<TransformerBlockCache>,
+    final_norm: LayerNormCache,
+}
+
+pub struct GPTGradients {
+    pub token_embedding: Tensor,
+    pub position_embedding: Tensor,
+    pub blocks: Vec<TransformerBlockGradients>,
+    pub final_norm: LayerNormGradients,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -428,6 +617,80 @@ impl GPTModel {
         Ok(())
     }
 
+    pub fn forward_with_cache(
+        &self,
+        token_indices: &[u32],
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor, GPTForwardCache)> {
+        if batch_size == 0 {
+            return Err(anyhow!("GPTModel forward expects batch_size > 0"));
+        }
+        if seq_len == 0 {
+            return Err(anyhow!("GPTModel forward expects seq_len > 0"));
+        }
+        if seq_len > self.config.max_seq_len {
+            return Err(anyhow!(
+                "seq_len {} exceeds configured max_seq_len {}",
+                seq_len,
+                self.config.max_seq_len
+            ));
+        }
+
+        let expected_tokens = batch_size
+            .checked_mul(seq_len)
+            .ok_or_else(|| anyhow!("GPTModel forward dimensions overflow"))?;
+        if token_indices.len() != expected_tokens {
+            return Err(anyhow!(
+                "Expected {} token indices (batch_size * seq_len) but received {}",
+                expected_tokens,
+                token_indices.len()
+            ));
+        }
+
+        let (token_embeddings, token_cache) =
+            self.token_embedding
+                .forward_with_cache(token_indices, batch_size, seq_len)?;
+
+        let mut position_indices = Vec::with_capacity(expected_tokens);
+        for _ in 0..batch_size {
+            for position in 0..seq_len {
+                position_indices.push(position as u32);
+            }
+        }
+        let (position_embeddings, position_cache) =
+            self.position_embedding
+                .forward_with_cache(&position_indices, batch_size, seq_len)?;
+
+        let mut hidden = token_embeddings.add(&position_embeddings)?;
+        let mut block_caches = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let (next_hidden, cache) = block.forward_with_cache(&hidden)?;
+            block_caches.push(cache);
+            hidden = next_hidden;
+        }
+
+        let (final_hidden, final_norm_cache) = self.final_norm.forward_with_cache(&hidden)?;
+        let flat_hidden =
+            final_hidden.reshape(vec![batch_size * seq_len, self.config.embed_dim])?;
+
+        let mut logits = flat_hidden.matmul(&self.lm_head_weight)?;
+        if let Some(bias) = &self.lm_head_bias {
+            logits = logits.add(bias)?;
+        }
+
+        let cache = GPTForwardCache {
+            batch_size,
+            seq_len,
+            token_embedding: token_cache,
+            position_embedding: position_cache,
+            block_caches,
+            final_norm: final_norm_cache,
+        };
+
+        Ok((flat_hidden, logits, cache))
+    }
+
     fn forward_internal(
         &self,
         token_indices: &[u32],
@@ -506,6 +769,80 @@ impl GPTModel {
     ) -> Result<Tensor> {
         let (_, logits) = self.forward_internal(token_indices, batch_size, seq_len)?;
         logits.reshape(vec![batch_size, seq_len, self.config.vocab_size])
+    }
+
+    pub fn backward(
+        &self,
+        cache: &GPTForwardCache,
+        grad_flat_hidden: &Tensor,
+    ) -> Result<GPTGradients> {
+        let expected_tokens = cache
+            .batch_size
+            .checked_mul(cache.seq_len)
+            .ok_or_else(|| anyhow!("GPTModel backward dimensions overflow"))?;
+
+        if grad_flat_hidden.shape().len() != 2 {
+            return Err(anyhow!(
+                "GPTModel backward expects grad_flat_hidden to be 2D, got {:?}",
+                grad_flat_hidden.shape()
+            ));
+        }
+
+        if grad_flat_hidden.shape()[0] != expected_tokens
+            || grad_flat_hidden.shape()[1] != self.config.embed_dim
+        {
+            return Err(anyhow!(
+                "GPTModel backward expects grad_flat_hidden shape [{}, {}], got {:?}",
+                expected_tokens,
+                self.config.embed_dim,
+                grad_flat_hidden.shape()
+            ));
+        }
+
+        if grad_flat_hidden.device.as_raw() != self.device.as_raw() {
+            return Err(anyhow!(
+                "grad_flat_hidden device does not match model device"
+            ));
+        }
+
+        if cache.block_caches.len() != self.blocks.len() {
+            return Err(anyhow!(
+                "GPTForwardCache block count {} does not match model block count {}",
+                cache.block_caches.len(),
+                self.blocks.len()
+            ));
+        }
+
+        let grad_hidden = grad_flat_hidden.clone().reshape(vec![
+            cache.batch_size,
+            cache.seq_len,
+            self.config.embed_dim,
+        ])?;
+
+        let (mut grad_current, final_norm_grads) =
+            self.final_norm.backward(&cache.final_norm, &grad_hidden)?;
+
+        let mut block_grads_rev = Vec::with_capacity(self.blocks.len());
+        for (block, block_cache) in self.blocks.iter().zip(cache.block_caches.iter()).rev() {
+            let (grad_prev, gradients) = block.backward(block_cache, &grad_current)?;
+            block_grads_rev.push(gradients);
+            grad_current = grad_prev;
+        }
+        block_grads_rev.reverse();
+
+        let grad_token_embedding = self
+            .token_embedding
+            .backward(&cache.token_embedding, &grad_current)?;
+        let grad_position_embedding = self
+            .position_embedding
+            .backward(&cache.position_embedding, &grad_current)?;
+
+        Ok(GPTGradients {
+            token_embedding: grad_token_embedding,
+            position_embedding: grad_position_embedding,
+            blocks: block_grads_rev,
+            final_norm: final_norm_grads,
+        })
     }
 
     pub fn device(&self) -> &Device {

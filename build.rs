@@ -21,10 +21,23 @@ fn main() {
         ("merge_heads_kernel.cu", "merge_heads_kernel.ptx"),
         ("attention_scores_kernel.cu", "attention_scores_kernel.ptx"),
         ("apply_attention_kernel.cu", "apply_attention_kernel.ptx"),
+        (
+            "apply_attention_backward_kernel.cu",
+            "apply_attention_backward_kernel.ptx",
+        ),
         ("layer_norm_kernel.cu", "layer_norm_kernel.ptx"),
         ("embedding_lookup_kernel.cu", "embedding_lookup_kernel.ptx"),
+        (
+            "embedding_backward_kernel.cu",
+            "embedding_backward_kernel.ptx",
+        ),
         ("cross_entropy_kernel.cu", "cross_entropy_kernel.ptx"),
+        (
+            "attention_scores_backward_kernel.cu",
+            "attention_scores_backward_kernel.ptx",
+        ),
         ("transpose_kernel.cu", "transpose_kernel.ptx"),
+        ("relu_backward_kernel.cu", "relu_backward_kernel.ptx"),
     ];
 
     for (cu_file, ptx_file) in kernels {

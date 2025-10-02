@@ -70,6 +70,30 @@ pub struct MultiHeadAttention {
     b_o: Option<Tensor>,
 }
 
+pub struct MultiHeadAttentionCache {
+    input_shape: Vec<usize>,
+    batch_size: usize,
+    seq_len: usize,
+    flattened_input: Tensor,
+    q_heads: Tensor,
+    k_heads: Tensor,
+    v_heads: Tensor,
+    probs_4d: Tensor,
+    probs_flat: Tensor,
+    context_flat: Tensor,
+}
+
+pub struct MultiHeadAttentionGradients {
+    pub w_q: Tensor,
+    pub w_k: Tensor,
+    pub w_v: Tensor,
+    pub w_o: Tensor,
+    pub b_q: Option<Tensor>,
+    pub b_k: Option<Tensor>,
+    pub b_v: Option<Tensor>,
+    pub b_o: Option<Tensor>,
+}
+
 impl MultiHeadAttention {
     pub fn new(device: &Device, embed_dim: usize, num_heads: usize) -> Result<Self> {
         if num_heads == 0 {
@@ -460,6 +484,372 @@ impl MultiHeadAttention {
         Ok(result)
     }
 
+    pub fn forward_with_cache(&self, input: &Tensor) -> Result<(Tensor, MultiHeadAttentionCache)> {
+        if input.shape().len() != 3 {
+            return Err(anyhow!(
+                "MultiHeadAttention expects input shaped [batch, seq_len, embed_dim], got {:?}",
+                input.shape()
+            ));
+        }
+
+        let batch_size = input.shape()[0];
+        let seq_len = input.shape()[1];
+        let embed_dim = input.shape()[2];
+
+        if embed_dim != self.embed_dim {
+            return Err(anyhow!(
+                "Input embed_dim ({}) does not match layer embed_dim ({})",
+                embed_dim,
+                self.embed_dim
+            ));
+        }
+
+        if input.device.as_raw() != self.w_q.device.as_raw() {
+            return Err(anyhow!(
+                "Input tensor and layer weights must share the same device"
+            ));
+        }
+
+        let input_shape = input.shape().to_vec();
+
+        let flattened = input
+            .clone()
+            .reshape(vec![batch_size * seq_len, embed_dim])?;
+
+        let q_linear = self.project(&flattened, &self.w_q, self.b_q.as_ref())?;
+        let k_linear = self.project(&flattened, &self.w_k, self.b_k.as_ref())?;
+        let v_linear = self.project(&flattened, &self.w_v, self.b_v.as_ref())?;
+
+        let q_seq = q_linear
+            .clone()
+            .reshape(vec![batch_size, seq_len, embed_dim])?;
+        let k_seq = k_linear
+            .clone()
+            .reshape(vec![batch_size, seq_len, embed_dim])?;
+        let v_seq = v_linear
+            .clone()
+            .reshape(vec![batch_size, seq_len, embed_dim])?;
+
+        let q_heads = self.split_heads(&q_seq, batch_size, seq_len)?;
+        let k_heads = self.split_heads(&k_seq, batch_size, seq_len)?;
+        let v_heads = self.split_heads(&v_seq, batch_size, seq_len)?;
+
+        let scores = self.compute_attention_scores(&q_heads, &k_heads, batch_size, seq_len)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let scaled_scores = scores.mul_scalar(scale)?;
+
+        let probs_flat = scaled_scores
+            .reshape(vec![batch_size * self.num_heads * seq_len, seq_len])?
+            .softmax()?;
+        let probs_4d =
+            probs_flat
+                .clone()
+                .reshape(vec![batch_size, self.num_heads, seq_len, seq_len])?;
+
+        let context_heads = self.apply_attention(&probs_4d, &v_heads, batch_size, seq_len)?;
+        let context = self.merge_heads(&context_heads, batch_size, seq_len)?;
+
+        let context_flat = context.reshape(vec![batch_size * seq_len, embed_dim])?;
+        let mut output_flat = context_flat.matmul(&self.w_o)?;
+        if let Some(bias) = &self.b_o {
+            output_flat = output_flat.add(bias)?;
+        }
+        let output = output_flat.reshape(vec![batch_size, seq_len, embed_dim])?;
+
+        let cache = MultiHeadAttentionCache {
+            input_shape,
+            batch_size,
+            seq_len,
+            flattened_input: flattened,
+            q_heads,
+            k_heads,
+            v_heads,
+            probs_4d,
+            probs_flat,
+            context_flat,
+        };
+
+        Ok((output, cache))
+    }
+
+    pub fn backward(
+        &self,
+        cache: &MultiHeadAttentionCache,
+        grad_output: &Tensor,
+    ) -> Result<(Tensor, MultiHeadAttentionGradients)> {
+        if grad_output.shape() != cache.input_shape.as_slice() {
+            return Err(anyhow!(
+                "MultiHeadAttention backward expects grad_output with shape {:?}, got {:?}",
+                cache.input_shape,
+                grad_output.shape()
+            ));
+        }
+
+        let grad_output_flat = grad_output
+            .clone()
+            .reshape(vec![cache.batch_size * cache.seq_len, self.embed_dim])?;
+
+        let (grad_context_flat, grad_w_o) =
+            Tensor::matmul_backward(&cache.context_flat, &self.w_o, &grad_output_flat)?;
+
+        let grad_b_o = if self.b_o.is_some() {
+            Some(grad_output_flat.sum_columns()?)
+        } else {
+            None
+        };
+
+        let grad_context =
+            grad_context_flat.reshape(vec![cache.batch_size, cache.seq_len, self.embed_dim])?;
+        let grad_context_heads =
+            self.split_heads(&grad_context, cache.batch_size, cache.seq_len)?;
+
+        let (grad_probs, grad_v_heads) = self.launch_apply_attention_backward(
+            &grad_context_heads,
+            &cache.probs_4d,
+            &cache.v_heads,
+            cache.batch_size,
+            cache.seq_len,
+        )?;
+
+        let grad_probs_flat = grad_probs.reshape(vec![
+            cache.batch_size * self.num_heads * cache.seq_len,
+            cache.seq_len,
+        ])?;
+        let grad_scaled_flat = Tensor::softmax_backward(&cache.probs_flat, &grad_probs_flat)?;
+        let grad_scaled = grad_scaled_flat.reshape(vec![
+            cache.batch_size,
+            self.num_heads,
+            cache.seq_len,
+            cache.seq_len,
+        ])?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let grad_scores = grad_scaled.mul_scalar(scale)?;
+
+        let (grad_q_heads, grad_k_heads) = self.launch_attention_scores_backward(
+            &grad_scores,
+            &cache.q_heads,
+            &cache.k_heads,
+            cache.batch_size,
+            cache.seq_len,
+        )?;
+
+        let grad_v = self.merge_heads(&grad_v_heads, cache.batch_size, cache.seq_len)?;
+        let grad_q = self.merge_heads(&grad_q_heads, cache.batch_size, cache.seq_len)?;
+        let grad_k = self.merge_heads(&grad_k_heads, cache.batch_size, cache.seq_len)?;
+
+        let grad_v_flat = grad_v.reshape(vec![cache.batch_size * cache.seq_len, self.embed_dim])?;
+        let grad_q_flat = grad_q.reshape(vec![cache.batch_size * cache.seq_len, self.embed_dim])?;
+        let grad_k_flat = grad_k.reshape(vec![cache.batch_size * cache.seq_len, self.embed_dim])?;
+
+        let (grad_flat_q, grad_w_q) =
+            Tensor::matmul_backward(&cache.flattened_input, &self.w_q, &grad_q_flat)?;
+        let (grad_flat_k, grad_w_k) =
+            Tensor::matmul_backward(&cache.flattened_input, &self.w_k, &grad_k_flat)?;
+        let (grad_flat_v, grad_w_v) =
+            Tensor::matmul_backward(&cache.flattened_input, &self.w_v, &grad_v_flat)?;
+
+        let grad_b_q = if self.b_q.is_some() {
+            Some(grad_q_flat.sum_columns()?)
+        } else {
+            None
+        };
+        let grad_b_k = if self.b_k.is_some() {
+            Some(grad_k_flat.sum_columns()?)
+        } else {
+            None
+        };
+        let grad_b_v = if self.b_v.is_some() {
+            Some(grad_v_flat.sum_columns()?)
+        } else {
+            None
+        };
+
+        let grad_input_flat = grad_flat_q.add(&grad_flat_k)?.add(&grad_flat_v)?;
+        let grad_input = grad_input_flat.reshape(cache.input_shape.clone())?;
+
+        let gradients = MultiHeadAttentionGradients {
+            w_q: grad_w_q,
+            w_k: grad_w_k,
+            w_v: grad_w_v,
+            w_o: grad_w_o,
+            b_q: grad_b_q,
+            b_k: grad_b_k,
+            b_v: grad_b_v,
+            b_o: grad_b_o,
+        };
+
+        Ok((grad_input, gradients))
+    }
+
+    fn launch_apply_attention_backward(
+        &self,
+        grad_context: &Tensor,
+        attention: &Tensor,
+        value: &Tensor,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let expected_context_shape = [batch_size, self.num_heads, seq_len, self.head_dim];
+        if grad_context.shape() != expected_context_shape {
+            return Err(anyhow!(
+                "apply_attention_backward expects grad_context with shape {:?}, got {:?}",
+                expected_context_shape,
+                grad_context.shape()
+            ));
+        }
+        let expected_attention_shape = [batch_size, self.num_heads, seq_len, seq_len];
+        if attention.shape() != expected_attention_shape {
+            return Err(anyhow!(
+                "apply_attention_backward expects attention with shape {:?}, got {:?}",
+                expected_attention_shape,
+                attention.shape()
+            ));
+        }
+        if value.shape() != expected_context_shape {
+            return Err(anyhow!(
+                "apply_attention_backward expects value with shape {:?}, got {:?}",
+                expected_context_shape,
+                value.shape()
+            ));
+        }
+
+        if grad_context.device.as_raw() != attention.device.as_raw()
+            || grad_context.device.as_raw() != value.device.as_raw()
+        {
+            return Err(anyhow!(
+                "apply_attention_backward tensors must reside on the same CUDA device"
+            ));
+        }
+
+        let grad_attention = Tensor::new(expected_attention_shape.to_vec(), &grad_context.device)?;
+        let grad_value = Tensor::new(expected_context_shape.to_vec(), &grad_context.device)?;
+
+        let total = batch_size
+            .checked_mul(self.num_heads)
+            .and_then(|v| v.checked_mul(seq_len))
+            .and_then(|v| v.checked_mul(self.head_dim))
+            .ok_or_else(|| anyhow!("apply_attention_backward launch configuration overflow"))?;
+        if total > i32::MAX as usize {
+            return Err(anyhow!(
+                "apply_attention_backward tensor too large for kernel launch"
+            ));
+        }
+
+        let block_size = 256u32;
+        let grid_size = ((total as u32) + block_size - 1) / block_size;
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+        let module = kernel_cache::module(
+            include_str!("apply_attention_backward_kernel.ptx"),
+            "apply_attention_backward",
+        )?;
+        let function = module
+            .get_function("apply_attention_backward_kernel")
+            .context("Kernel load failed for apply_attention_backward_kernel")?;
+
+        unsafe {
+            launch!(function<<<grid_size, block_size, 0, stream>>>(
+                grad_context.data.as_device_ptr(),
+                attention.data.as_device_ptr(),
+                value.data.as_device_ptr(),
+                grad_attention.data.as_device_ptr(),
+                grad_value.data.as_device_ptr(),
+                batch_size as i32,
+                self.num_heads as i32,
+                seq_len as i32,
+                self.head_dim as i32
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .context("Stream sync failed for apply_attention_backward_kernel")?;
+
+        Ok((grad_attention, grad_value))
+    }
+
+    fn launch_attention_scores_backward(
+        &self,
+        grad_scores: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let expected_scores_shape = [batch_size, self.num_heads, seq_len, seq_len];
+        if grad_scores.shape() != expected_scores_shape {
+            return Err(anyhow!(
+                "attention_scores_backward expects grad_scores with shape {:?}, got {:?}",
+                expected_scores_shape,
+                grad_scores.shape()
+            ));
+        }
+        let expected_proj_shape = [batch_size, self.num_heads, seq_len, self.head_dim];
+        for (name, tensor) in [("query", query), ("key", key)] {
+            if tensor.shape() != expected_proj_shape {
+                return Err(anyhow!(
+                    "attention_scores_backward expects {name} with shape {:?}, got {:?}",
+                    expected_proj_shape,
+                    tensor.shape()
+                ));
+            }
+        }
+
+        if grad_scores.device.as_raw() != query.device.as_raw()
+            || grad_scores.device.as_raw() != key.device.as_raw()
+        {
+            return Err(anyhow!(
+                "attention_scores_backward tensors must reside on the same CUDA device"
+            ));
+        }
+
+        let grad_query = Tensor::new(expected_proj_shape.to_vec(), &grad_scores.device)?;
+        let grad_key = Tensor::new(expected_proj_shape.to_vec(), &grad_scores.device)?;
+
+        let total = batch_size
+            .checked_mul(self.num_heads)
+            .and_then(|v| v.checked_mul(seq_len))
+            .and_then(|v| v.checked_mul(seq_len))
+            .ok_or_else(|| anyhow!("attention_scores_backward launch configuration overflow"))?;
+        if total > i32::MAX as usize {
+            return Err(anyhow!(
+                "attention_scores_backward tensor too large for kernel launch"
+            ));
+        }
+
+        let block_size = 256u32;
+        let grid_size = ((total as u32) + block_size - 1) / block_size;
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+        let module = kernel_cache::module(
+            include_str!("attention_scores_backward_kernel.ptx"),
+            "attention_scores_backward",
+        )?;
+        let function = module
+            .get_function("attention_scores_backward_kernel")
+            .context("Kernel load failed for attention_scores_backward_kernel")?;
+
+        unsafe {
+            launch!(function<<<grid_size, block_size, 0, stream>>>(
+                grad_scores.data.as_device_ptr(),
+                query.data.as_device_ptr(),
+                key.data.as_device_ptr(),
+                grad_query.data.as_device_ptr(),
+                grad_key.data.as_device_ptr(),
+                batch_size as i32,
+                self.num_heads as i32,
+                seq_len as i32,
+                self.head_dim as i32
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .context("Stream sync failed for attention_scores_backward_kernel")?;
+
+        Ok((grad_query, grad_key))
+    }
+
     pub fn append_named_tensors<'a>(&'a self, prefix: &str, out: &mut Vec<(String, &'a Tensor)>) {
         out.push((format!("{prefix}.w_q"), &self.w_q));
         out.push((format!("{prefix}.w_k"), &self.w_k));
@@ -508,70 +898,8 @@ impl MultiHeadAttention {
 
 impl Layer for MultiHeadAttention {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        if input.shape().len() != 3 {
-            return Err(anyhow!(
-                "MultiHeadAttention expects input shaped [batch, seq_len, embed_dim], got {:?}",
-                input.shape()
-            ));
-        }
-
-        let batch_size = input.shape()[0];
-        let seq_len = input.shape()[1];
-        let embed_dim = input.shape()[2];
-
-        if embed_dim != self.embed_dim {
-            return Err(anyhow!(
-                "Input embed_dim ({}) does not match layer embed_dim ({})",
-                embed_dim,
-                self.embed_dim
-            ));
-        }
-
-        if input.device.as_raw() != self.w_q.device.as_raw() {
-            return Err(anyhow!(
-                "Input tensor and layer weights must share the same device"
-            ));
-        }
-
-        let flattened = input
-            .clone()
-            .reshape(vec![batch_size * seq_len, embed_dim])?;
-
-        let q = self.project(&flattened, &self.w_q, self.b_q.as_ref())?;
-        let k = self.project(&flattened, &self.w_k, self.b_k.as_ref())?;
-        let v = self.project(&flattened, &self.w_v, self.b_v.as_ref())?;
-
-        let q = q.reshape(vec![batch_size, seq_len, embed_dim])?;
-        let k = k.reshape(vec![batch_size, seq_len, embed_dim])?;
-        let v = v.reshape(vec![batch_size, seq_len, embed_dim])?;
-
-        let q_heads = self.split_heads(&q, batch_size, seq_len)?;
-        let k_heads = self.split_heads(&k, batch_size, seq_len)?;
-        let v_heads = self.split_heads(&v, batch_size, seq_len)?;
-
-        let scores = self.compute_attention_scores(&q_heads, &k_heads, batch_size, seq_len)?;
-        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let scaled_scores = scores.mul_scalar(scale)?;
-
-        let probs = scaled_scores
-            .reshape(vec![batch_size * self.num_heads * seq_len, seq_len])?
-            .softmax()?
-            .reshape(vec![batch_size, self.num_heads, seq_len, seq_len])?;
-
-        let context = self.apply_attention(&probs, &v_heads, batch_size, seq_len)?;
-        let context = self.merge_heads(&context, batch_size, seq_len)?;
-
-        let output = context
-            .reshape(vec![batch_size * seq_len, embed_dim])?
-            .matmul(&self.w_o)?;
-
-        let output = if let Some(bias) = &self.b_o {
-            output.add(bias)?
-        } else {
-            output
-        };
-
-        output.reshape(vec![batch_size, seq_len, embed_dim])
+        let (output, _) = self.forward_with_cache(input)?;
+        Ok(output)
     }
 }
 
@@ -791,6 +1119,118 @@ impl Layer for FeedForwardNetwork {
     }
 }
 
+pub struct FeedForwardCache {
+    input_shape: Vec<usize>,
+    flat_input: Tensor,
+    hidden_pre_activation: Tensor,
+    hidden_post_activation: Tensor,
+}
+
+pub struct FeedForwardGradients {
+    pub w1: Tensor,
+    pub b1: Option<Tensor>,
+    pub w2: Tensor,
+    pub b2: Option<Tensor>,
+}
+
+impl FeedForwardNetwork {
+    pub fn forward_with_cache(&self, input: &Tensor) -> Result<(Tensor, FeedForwardCache)> {
+        if input.shape().is_empty() {
+            return Err(anyhow!(
+                "FeedForwardNetwork expects input with at least one dimension, got {:?}",
+                input.shape()
+            ));
+        }
+
+        if *input.shape().last().unwrap() != self.input_dim {
+            return Err(anyhow!(
+                "FeedForwardNetwork expects last dimension {} but found {}",
+                self.input_dim,
+                input.shape().last().unwrap()
+            ));
+        }
+
+        if input.device.as_raw() != self.w1.device.as_raw() {
+            return Err(anyhow!(
+                "FeedForwardNetwork input tensor must share the same device as the weights"
+            ));
+        }
+
+        let rows = input.size() / self.input_dim;
+        let flat_input = input.clone().reshape(vec![rows, self.input_dim])?;
+
+        let mut hidden_pre = flat_input.matmul(&self.w1)?;
+        if let Some(bias) = &self.b1 {
+            hidden_pre = hidden_pre.add(bias)?;
+        }
+        let hidden_post = hidden_pre.relu()?;
+
+        let mut output_flat = hidden_post.matmul(&self.w2)?;
+        if let Some(bias) = &self.b2 {
+            output_flat = output_flat.add(bias)?;
+        }
+
+        let output = output_flat.clone().reshape(input.shape().to_vec())?;
+        let cache = FeedForwardCache {
+            input_shape: input.shape().to_vec(),
+            flat_input,
+            hidden_pre_activation: hidden_pre,
+            hidden_post_activation: hidden_post,
+        };
+
+        Ok((output, cache))
+    }
+
+    pub fn backward(
+        &self,
+        cache: &FeedForwardCache,
+        grad_output: &Tensor,
+    ) -> Result<(Tensor, FeedForwardGradients)> {
+        if grad_output.shape() != cache.input_shape.as_slice() {
+            return Err(anyhow!(
+                "FeedForwardNetwork backward expects grad_output with shape {:?}, got {:?}",
+                cache.input_shape,
+                grad_output.shape()
+            ));
+        }
+
+        let rows = cache.flat_input.shape()[0];
+        let grad_output_flat = grad_output.clone().reshape(vec![rows, self.input_dim])?;
+
+        let (grad_hidden_post, grad_w2) =
+            Tensor::matmul_backward(&cache.hidden_post_activation, &self.w2, &grad_output_flat)?;
+
+        let grad_b2 = if self.b2.is_some() {
+            Some(grad_output_flat.sum_columns()?)
+        } else {
+            None
+        };
+
+        let grad_hidden_pre =
+            Tensor::relu_backward(&cache.hidden_pre_activation, &grad_hidden_post)?;
+
+        let (grad_flat_input, grad_w1) =
+            Tensor::matmul_backward(&cache.flat_input, &self.w1, &grad_hidden_pre)?;
+
+        let grad_b1 = if self.b1.is_some() {
+            Some(grad_hidden_pre.sum_columns()?)
+        } else {
+            None
+        };
+
+        let grad_input = grad_flat_input.reshape(cache.input_shape.clone())?;
+
+        let gradients = FeedForwardGradients {
+            w1: grad_w1,
+            b1: grad_b1,
+            w2: grad_w2,
+            b2: grad_b2,
+        };
+
+        Ok((grad_input, gradients))
+    }
+}
+
 pub struct LayerNorm {
     normalized_dim: usize,
     gamma: Tensor,
@@ -947,5 +1387,136 @@ impl Layer for LayerNorm {
             .context("Stream sync failed for layer_norm")?;
 
         Ok(result)
+    }
+}
+
+pub struct LayerNormCache {
+    input_shape: Vec<usize>,
+    rows: usize,
+    normalized: Tensor,
+    inv_std: Tensor,
+}
+
+pub struct LayerNormGradients {
+    pub gamma: Tensor,
+    pub beta: Tensor,
+}
+
+impl LayerNorm {
+    pub fn forward_with_cache(&self, input: &Tensor) -> Result<(Tensor, LayerNormCache)> {
+        if input.shape().is_empty() {
+            return Err(anyhow!(
+                "LayerNorm expects a tensor with at least one dimension"
+            ));
+        }
+
+        let last_dim = *input.shape().last().unwrap();
+        if last_dim != self.normalized_dim {
+            return Err(anyhow!(
+                "LayerNorm expected last dimension {} but found {}",
+                self.normalized_dim,
+                last_dim
+            ));
+        }
+
+        if input.device.as_raw() != self.gamma.device.as_raw() {
+            return Err(anyhow!(
+                "LayerNorm input and parameters must share the same device"
+            ));
+        }
+
+        let input_shape = input.shape().to_vec();
+        let rows = input.size() / self.normalized_dim;
+        let input_2d = input.clone().reshape(vec![rows, self.normalized_dim])?;
+
+        let sum = input_2d.sum_rows()?;
+        let mean = sum.div_scalar(self.normalized_dim as f32)?;
+        let mean_2d = mean.reshape(vec![rows, 1])?;
+        let centered = input_2d.sub(&mean_2d)?;
+
+        let squared = centered.mul(&centered)?;
+        let variance = squared.sum_rows()?.div_scalar(self.normalized_dim as f32)?;
+        let variance_eps = variance.add_scalar(self.eps)?;
+
+        let variance_host = variance_eps.to_host()?;
+        let inv_std_host: Vec<f32> = variance_host
+            .iter()
+            .map(|value| 1.0f32 / value.sqrt())
+            .collect();
+        let inv_std_2d = Tensor::from_host(inv_std_host.clone(), vec![rows, 1], &input.device)?;
+        let inv_std = Tensor::from_host(inv_std_host, vec![rows], &input.device)?;
+
+        let normalized = centered.mul(&inv_std_2d)?;
+        let gamma_broadcast = self.gamma.clone().reshape(vec![1, self.normalized_dim])?;
+        let beta_broadcast = self.beta.clone().reshape(vec![1, self.normalized_dim])?;
+        let output_2d = normalized.mul(&gamma_broadcast)?.add(&beta_broadcast)?;
+        let output = output_2d.clone().reshape(input_shape.clone())?;
+
+        let cache = LayerNormCache {
+            input_shape,
+            rows,
+            normalized,
+            inv_std,
+        };
+
+        Ok((output, cache))
+    }
+
+    pub fn backward(
+        &self,
+        cache: &LayerNormCache,
+        grad_output: &Tensor,
+    ) -> Result<(Tensor, LayerNormGradients)> {
+        if grad_output.shape() != cache.input_shape.as_slice() {
+            return Err(anyhow!(
+                "LayerNorm backward expects grad_output with shape {:?}, got {:?}",
+                cache.input_shape,
+                grad_output.shape()
+            ));
+        }
+
+        let grad_output_2d = grad_output
+            .clone()
+            .reshape(vec![cache.rows, self.normalized_dim])?;
+        let normalized = cache.normalized.clone();
+        let inv_std_2d = cache.inv_std.clone().reshape(vec![cache.rows, 1])?;
+
+        let gamma_broadcast = self.gamma.clone().reshape(vec![1, self.normalized_dim])?;
+        let grad_scaled = grad_output_2d.mul(&gamma_broadcast)?;
+
+        let sum_grad = grad_scaled
+            .clone()
+            .sum_rows()?
+            .reshape(vec![cache.rows, 1])?;
+        let sum_dot = grad_scaled
+            .clone()
+            .mul(&normalized)?
+            .sum_rows()?
+            .reshape(vec![cache.rows, 1])?;
+
+        let n = self.normalized_dim as f32;
+        let numerator = grad_scaled
+            .mul_scalar(n)?
+            .sub(&sum_grad)?
+            .sub(&normalized.mul(&sum_dot)?)?;
+        let grad_input_2d = numerator.mul(&inv_std_2d)?.mul_scalar(1.0 / n)?;
+        let grad_input = grad_input_2d.reshape(cache.input_shape.clone())?;
+
+        let grad_gamma = grad_output_2d
+            .clone()
+            .mul(&normalized)?
+            .transpose2d()?
+            .sum_rows()?;
+        let grad_gamma = grad_gamma.reshape(vec![self.normalized_dim])?;
+
+        let grad_beta = grad_output_2d.transpose2d()?.sum_rows()?;
+        let grad_beta = grad_beta.reshape(vec![self.normalized_dim])?;
+
+        let gradients = LayerNormGradients {
+            gamma: grad_gamma,
+            beta: grad_beta,
+        };
+
+        Ok((grad_input, gradients))
     }
 }

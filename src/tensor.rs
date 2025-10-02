@@ -186,6 +186,58 @@ impl Tensor {
         Ok(result)
     }
 
+    /// Computes analytic gradients for a matrix multiplication.
+    ///
+    /// Given \(C = A \times B\) and an upstream gradient `grad_output = ∂L/∂C`,
+    /// this returns `(∂L/∂A, ∂L/∂B)`.
+    pub fn matmul_backward(
+        lhs: &Tensor,
+        rhs: &Tensor,
+        grad_output: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        ensure_same_device(&lhs.device, &rhs.device)?;
+        ensure_same_device(&lhs.device, &grad_output.device)?;
+
+        if lhs.shape.len() != 2 || rhs.shape.len() != 2 || grad_output.shape.len() != 2 {
+            return Err(anyhow!(
+                "matmul_backward expects 2D tensors, got lhs {:?}, rhs {:?}, grad {:?}",
+                lhs.shape,
+                rhs.shape,
+                grad_output.shape()
+            ));
+        }
+
+        let m = lhs.shape[0];
+        let k = lhs.shape[1];
+        let rhs_rows = rhs.shape[0];
+        let n = rhs.shape[1];
+
+        if rhs_rows != k {
+            return Err(anyhow!(
+                "matmul_backward dimension mismatch: lhs {:?} vs rhs {:?}",
+                lhs.shape,
+                rhs.shape()
+            ));
+        }
+
+        if grad_output.shape()[0] != m || grad_output.shape()[1] != n {
+            return Err(anyhow!(
+                "matmul_backward grad_output shape {:?} incompatible with forward ({}, {})",
+                grad_output.shape(),
+                m,
+                n
+            ));
+        }
+
+        let rhs_t = rhs.transpose2d()?;
+        let grad_lhs = grad_output.matmul(&rhs_t)?;
+
+        let lhs_t = lhs.transpose2d()?;
+        let grad_rhs = lhs_t.matmul(grad_output)?;
+
+        Ok((grad_lhs, grad_rhs))
+    }
+
     /// Performs a binary elementwise operation on two tensors with broadcasting support.
     ///
     /// This method handles broadcasting of tensor shapes, computes the output shape,
@@ -251,6 +303,13 @@ impl Tensor {
             other,
             KernelSpec::new("add", include_str!("add_kernel.ptx"), "add_kernel"),
         )
+    }
+
+    /// Computes the squared L2 norm of the tensor by summing the squares of all elements.
+    pub fn l2_norm_squared(&self) -> Result<f32> {
+        let host = self.to_host()?;
+        let sum = host.iter().map(|&value| value * value).sum();
+        Ok(sum)
     }
 
     /// Backwards-compatible helper that forwards to [`Tensor::add`].
@@ -372,6 +431,30 @@ impl Tensor {
         exponentiated.div(&denom)
     }
 
+    /// Computes the gradient of a row-wise softmax given the upstream gradient and the softmax output.
+    pub fn softmax_backward(probs: &Tensor, grad_output: &Tensor) -> Result<Tensor> {
+        ensure_same_device(&probs.device, &grad_output.device)?;
+
+        if probs.shape.len() != 2 {
+            return Err(anyhow!(
+                "softmax_backward expects 2D probability tensor, got {:?}",
+                probs.shape
+            ));
+        }
+        if grad_output.shape() != probs.shape() {
+            return Err(anyhow!(
+                "softmax_backward gradient shape {:?} must match probs shape {:?}",
+                grad_output.shape(),
+                probs.shape()
+            ));
+        }
+
+        let dot = grad_output.mul(probs)?;
+        let sum = dot.sum_rows()?; // shape [batch, 1]
+        let adjusted = grad_output.sub(&sum)?;
+        adjusted.mul(probs)
+    }
+
     fn unary_elementwise(&self, kernel: KernelSpec) -> Result<Tensor> {
         let result = Tensor::new(self.shape.clone(), &self.device)?;
         let stream =
@@ -479,6 +562,21 @@ impl Tensor {
         self.rowwise_sum(rows, cols)
     }
 
+    /// Computes the sum across the first dimension for each column of a 2D tensor.
+    pub fn sum_columns(&self) -> Result<Tensor> {
+        if self.shape.len() != 2 {
+            return Err(anyhow!(
+                "sum_columns expects a 2D tensor, but received shape {:?}",
+                self.shape
+            ));
+        }
+
+        let cols = self.shape[1];
+        let transposed = self.transpose2d()?;
+        let summed = transposed.sum_rows()?;
+        summed.reshape(vec![1, cols])
+    }
+
     fn rowwise_reduce(&self, kernel: KernelSpec, rows: usize, cols: usize) -> Result<Tensor> {
         if rows == 0 || cols == 0 {
             return Err(anyhow!(
@@ -522,6 +620,51 @@ impl Tensor {
         stream
             .synchronize()
             .with_context(|| format!("Stream sync failed for {}", kernel.human_name))?;
+        Ok(result)
+    }
+
+    /// Backpropagates gradients through a ReLU activation.
+    pub fn relu_backward(input: &Tensor, grad_output: &Tensor) -> Result<Tensor> {
+        ensure_same_device(&input.device, &grad_output.device)?;
+
+        if input.shape() != grad_output.shape() {
+            return Err(anyhow!(
+                "relu_backward shape mismatch: input {:?} vs grad {:?}",
+                input.shape(),
+                grad_output.shape()
+            ));
+        }
+
+        let total = input.size();
+        if total > i32::MAX as usize {
+            return Err(anyhow!("relu_backward tensor too large for kernel launch"));
+        }
+
+        let result = Tensor::new(input.shape().to_vec(), &input.device)?;
+        let block_size = 256u32;
+        let grid_size = ((total as u32) + block_size - 1) / block_size;
+
+        let module =
+            kernel_cache::module(include_str!("relu_backward_kernel.ptx"), "relu_backward")?;
+        let function = module
+            .get_function("relu_backward_kernel")
+            .context("Kernel load failed for relu_backward")?;
+        let stream =
+            Stream::new(StreamFlags::NON_BLOCKING, None).context("Failed to create CUDA stream")?;
+
+        unsafe {
+            launch!(function<<<grid_size, block_size, 0, stream>>>(
+                grad_output.data.as_device_ptr(),
+                input.data.as_device_ptr(),
+                result.data.as_device_ptr(),
+                total as i32
+            ))?;
+        }
+
+        stream
+            .synchronize()
+            .context("Stream sync failed for relu_backward")?;
+
         Ok(result)
     }
 }
