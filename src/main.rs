@@ -124,18 +124,18 @@ fn run_training(
 ) -> Result<()> {
     let tokenizer = Tokenizer::new();
 
-    let base_learning_rate = 1e-3;
+    let base_learning_rate = 3e-4;
 
     let training_config = TrainingConfig {
-        batch_size: 4,
-        seq_len: 128,
+        batch_size: 24,
+        seq_len: 384,
         learning_rate: base_learning_rate,
         epochs,
-        max_sequences_per_epoch: Some(8192),
+        max_sequences_per_epoch: Some(16384),
         shuffle_windows: true,
-        momentum: 0.9,
-        weight_decay: 1e-2,
-        log_every: 100,
+        momentum: 0.95,
+        weight_decay: 2e-2,
+        log_every: 50,
         gradient_clip_norm: Some(1.0),
     };
     training_config.validate()?;
@@ -143,10 +143,10 @@ fn run_training(
     let model_config = GPTConfig {
         vocab_size: tokenizer.vocab_size(),
         max_seq_len: training_config.seq_len,
-        embed_dim: 128,
-        num_heads: 4,
-        num_layers: 2,
-        feed_forward_dim: 512,
+        embed_dim: 512,
+        num_heads: 8,
+        num_layers: 6,
+        feed_forward_dim: 2048,
         layer_norm_eps: 1e-5,
         activation: ActivationKind::Relu,
     };
