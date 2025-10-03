@@ -107,10 +107,15 @@ impl MultiHeadAttention {
             ));
         }
 
+        let scale = 1.0f32 / (embed_dim as f32).sqrt();
         let w_q = Tensor::randn(vec![embed_dim, embed_dim], device)?;
+        let w_q = w_q.mul_scalar(scale)?;
         let w_k = Tensor::randn(vec![embed_dim, embed_dim], device)?;
+        let w_k = w_k.mul_scalar(scale)?;
         let w_v = Tensor::randn(vec![embed_dim, embed_dim], device)?;
+        let w_v = w_v.mul_scalar(scale)?;
         let w_o = Tensor::randn(vec![embed_dim, embed_dim], device)?;
+        let w_o = w_o.mul_scalar(scale)?;
 
         Self::assemble(
             embed_dim, num_heads, w_q, w_k, w_v, w_o, None, None, None, None,
@@ -921,8 +926,12 @@ impl FeedForwardNetwork {
         hidden_dim: usize,
         activation: ActivationKind,
     ) -> Result<Self> {
+        let w1_scale = 1.0f32 / (input_dim as f32).sqrt();
+        let w2_scale = 1.0f32 / (hidden_dim as f32).sqrt();
         let w1 = Tensor::randn(vec![input_dim, hidden_dim], device)?;
+        let w1 = w1.mul_scalar(w1_scale)?;
         let w2 = Tensor::randn(vec![hidden_dim, input_dim], device)?;
+        let w2 = w2.mul_scalar(w2_scale)?;
         let b1 = Tensor::new(vec![1, hidden_dim], device)?;
         let b2 = Tensor::new(vec![1, input_dim], device)?;
         Self::assemble(
@@ -942,8 +951,12 @@ impl FeedForwardNetwork {
         hidden_dim: usize,
         activation: ActivationKind,
     ) -> Result<Self> {
+        let w1_scale = 1.0f32 / (input_dim as f32).sqrt();
+        let w2_scale = 1.0f32 / (hidden_dim as f32).sqrt();
         let w1 = Tensor::randn(vec![input_dim, hidden_dim], device)?;
+        let w1 = w1.mul_scalar(w1_scale)?;
         let w2 = Tensor::randn(vec![hidden_dim, input_dim], device)?;
+        let w2 = w2.mul_scalar(w2_scale)?;
         Self::assemble(input_dim, hidden_dim, w1, None, w2, None, activation)
     }
 

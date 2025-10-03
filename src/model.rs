@@ -41,7 +41,9 @@ impl Embedding {
             return Err(anyhow!("embed_dim must be greater than zero"));
         }
 
+        let scale = 1.0f32 / (embed_dim as f32).sqrt();
         let weight = Tensor::randn(vec![vocab_size, embed_dim], device)?;
+        let weight = weight.mul_scalar(scale)?;
         Self::assemble(weight)
     }
 
@@ -499,7 +501,9 @@ impl GPTModel {
         }
 
         let final_norm = LayerNorm::new(device, config.embed_dim, config.layer_norm_eps)?;
+        let scale = 1.0f32 / (config.embed_dim as f32).sqrt();
         let lm_head_weight = Tensor::randn(vec![config.embed_dim, config.vocab_size], device)?;
+        let lm_head_weight = lm_head_weight.mul_scalar(scale)?;
         let lm_head_bias = Some(Tensor::new(vec![1, config.vocab_size], device)?);
 
         Ok(Self {

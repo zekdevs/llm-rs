@@ -118,7 +118,20 @@ impl Tensor {
     pub fn randn(shape: Vec<usize>, device: &Device) -> Result<Self> {
         let size = shape.iter().product::<usize>();
         let mut rng = rand::rng();
-        let host_data: Vec<f32> = (0..size).map(|_| rng.random::<f32>()).collect();
+        let mut host_data = Vec::with_capacity(size);
+
+        while host_data.len() < size {
+            let u1: f32 = rng.random::<f32>().max(f32::MIN_POSITIVE);
+            let u2: f32 = rng.random::<f32>();
+            let radius = (-2.0 * u1.ln()).sqrt();
+            let angle = std::f32::consts::TAU * u2;
+            let (sin, cos) = angle.sin_cos();
+            host_data.push(radius * cos);
+            if host_data.len() < size {
+                host_data.push(radius * sin);
+            }
+        }
+
         Self::from_host(host_data, shape, device)
     }
 
