@@ -2,7 +2,6 @@
 
 A simple GPT-based LLM implemented mainly in Rust. CUDA work happens through `cust`, `cublas`, and `cuda_std`, while bespoke CUDA C++ kernels power the heavy lifting.
 
-C++ is used for the CUDA kernels.
 
 Mostly, this was done for learning purposes to explore LLMs. The resulting model is usable, but it wasnt benchmarked and isnt anything special. You can check out the model weights [here](https://huggingface.co/zekdevs/llm-rs)
 
