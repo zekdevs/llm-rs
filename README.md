@@ -1,10 +1,11 @@
 # llm-rs
 
-A simple GPT-based LLM implemented mainly in Rust. CUDA work happens through `cust`, `cublas`, and `cuda_std`, while bespoke CUDA C++ kernels power the heavy lifting.
+A simple GPT-based LLM implemented mainly in Rust. CUDA work happens through `cust`, `cublas`, and `cuda_std`, while CUDA kernels power the heavy lifting.
 
 C++ is used for the CUDA kernels.
 
-Mostly, this was done for learning purposes to explore LLMs. The resulting model is usable, but it wasnt benchmarked and isnt anything special. You can check out the model weights [here](https://huggingface.co/zekdevs/llm-rs)
+Mostly, this was done for learning purposes to explore LLMs. The resulting model is usable, but it wasnt benchmarked and isnt anything special. You can check out the model weights [here](https://huggingface.co/zekdevs/llm-rs). This was my first attempt at touching anything related to LLMs, so its quite slopy, but proved to be a good entry point/learning experience. While mostly written by hand, full disclosure there are many parts where I had help from coding asistants/agents. Maybe starting my attempt in rust wasnt the best idea in the world...
+
 
 ## Dataset
 
